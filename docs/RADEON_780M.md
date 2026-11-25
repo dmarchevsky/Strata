@@ -208,10 +208,26 @@ stores as Q8_0 (49 in UD-Q4_K_XL) are used as stored, the file's own int8 values
 from the BF16 expansion. UD-Q4_K_XL, 2K prompt, 3 interleaved rounds: 11.1-11.3 tok/s (BF16) -> 14.2-14.3 (13.0-13.1 with
 the re-quantized copies). Against the BF16 path on the 4 texts above: mean KL 0.0031, perplexity -0.4% to +0.3%.
 
+**Reading long prompts** (agents). The engine reads a prompt in batches of at most 512 tokens on the 780M under Linux (a
+guard that keeps each GPU submission well under a second), so each expert gets about 32 tokens per batch and the grouped
+expert kernels' 128-token tiles run three quarters empty. `STRATA_INK_PREFILL_CHUNK=2048` together with the engine flag
+`--chunk 2048` (in Docker: `ENGINE_ARGS=--chunk 2048`) reads 2,048 tokens per batch; the engine then flushes every 2
+layer visits instead of 8, so a submission stays as long as before. The prompt attention also runs the 3 query heads of
+a KV head in one block now (on by default with `STRATA_INK_DECODE_780M`; the logits of a 3,000-token prompt were
+byte-identical to before). SQ-15, `--bench`, one run each (tok/s):
+
+| prompt | before | 2,048-token batches | + prompt attention change |
+| ---: | ---: | ---: | ---: |
+| 8K | 242 | 299-305 | 317 |
+| 32K | 208 | 255-256 | 281 |
+
+Through the server (8-bit trunk on), a 12,769-token prompt took 59.8 s before and 42.5 s with both (214 -> 301 tok/s).
+The ring check (`--ring-check`, 12,000 tokens in 2,048-token batches against one token at a time) passed: KL median
+1.1e-6, top-1 100%. No GPU reset in the kernel log over these runs (one machine, `cwsr_enable=0`). 1,024 gave 281 tok/s
+at 8K, 4,096 gave 303-306.
+
 Also measured, no change kept: GPU clocks forced to `high` (prompt +2%, decode unchanged: decode is bound by DDR5-5600);
-FP8 KV at 32K (decode 10.4 -> 10.5 tok/s, prompt 5% slower; k8v8 is not supported on HIP); `--chunk` 1024 / 2048 (the
-prompt is still read in 512-token batches, the SWA ring's span cap). About 62% of prompt time is the grouped expert
-kernels (about 32 tokens per expert per batch).
+FP8 KV at 32K (decode 10.4 -> 10.5 tok/s, prompt 5% slower; k8v8 is not supported on HIP).
 
 What still costs the most in a check is the experts: rows that pick different experts have to read them. The drafter's
 own 8-row matrix products (about 9 ms per draft) did not get faster with fewer barriers. The server's greedy output of a

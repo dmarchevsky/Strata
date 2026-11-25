@@ -2230,8 +2230,10 @@ __global__ void __launch_bounds__(32) k3_flash_splitkv_reduce(
 // Total LDS = 27.0 KB (< 32 KB -> 2 WG/CU!). Guarded #if INK_HAS_WMMA (zero WMMA emitted on RDNA2!).
 // Grid: (n_q_heads, (M + 63) / 64), Block: 128 (4 waves -> 16 Q rows per wave)
 // =================================================================================================
-template <bool FP8_KV>
-__global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
+// G > 1: the G query heads of one KV head in one block (128 * G threads, waves 4g .. 4g+3 = head g): each K / V tile is
+// loaded once for all of them; every wave does the same work as with G = 1. Grid: (n_q_heads / G, (M + 63) / 64).
+template <bool FP8_KV, int G = 1>
+__global__ void __launch_bounds__(128 * G) k3_flash_swa_gqa_prefill_wmma(
     const float* __restrict__ Q,            // [M, n_q_heads, 128]
     const float* __restrict__ gate_attn,    // nullptr or [M, n_q_heads, 128]
     const float* __restrict__ rel_bias,     // nullptr or [M, n_q_heads, max_rel]
@@ -2257,16 +2259,18 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
         alignas(16) half_t sVt[HD * LDV];  // [128, 72] for transposed V tiles
     };
     __shared__ KvBuf kv;
-    __shared__ alignas(16) half_t sP[BQ * LDP];
+    __shared__ alignas(16) half_t sP[G * BQ * LDP];
 
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
     const int lane = tid & 31;
     const int l16 = lane & 15;
     const int hi = lane >> 4;
-    const int qh = blockIdx.x;
+    constexpr int NT = 128 * G;
+    const int wl = wave & 3;                 // the wave's 16 query rows within the head's 64
+    const int qh = blockIdx.x * G + (wave >> 2);
     const int q_blk = blockIdx.y * BQ;
-    if (qh >= n_q_heads || q_blk >= M) return;
+    if (static_cast<int>(blockIdx.x) * G >= n_q_heads || q_blk >= M) return;
 
     const int kvh = qh / (n_q_heads / n_kv_heads);
     const int elems = n_kv_heads * HD;
@@ -2274,14 +2278,17 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
     const int32_t* pt_row = page_table + slot * max_pages_per_slot;
     const float scale = rsqrtf(128.0f);
 
-    // 1. Load Q[64, 128] scaled FP16 into kv.sK once, then keep wave's [16, 128] permanently in registers!
-    for (int idx = tid; idx < BQ * (HD / 4); idx += 128) {
+    // 1. Load Q[64, 128] scaled FP16 into kv.sK (one head at a time), then keep the wave's [16, 128] in registers!
+    wmma_h_t q_frag[8];
+    for (int g = 0; g < G; ++g) {
+    const int qhg = blockIdx.x * G + g;
+    for (int idx = tid; idx < BQ * (HD / 4); idx += NT) {
         const int r = idx >> 5;
         const int c4 = idx & 31;
         const int gm = q_blk + r;
         half_t* dst = &kv.sK[r * LDK + c4 * 4];
         if (gm < M) {
-            const float4 qv = *reinterpret_cast<const float4*>(Q + (static_cast<size_t>(gm) * n_q_heads + qh) * HD + c4 * 4);
+            const float4 qv = *reinterpret_cast<const float4*>(Q + (static_cast<size_t>(gm) * n_q_heads + qhg) * HD + c4 * 4);
             dst[0] = static_cast<half_t>(qv.x * scale);
             dst[1] = static_cast<half_t>(qv.y * scale);
             dst[2] = static_cast<half_t>(qv.z * scale);
@@ -2292,13 +2299,14 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
         }
     }
     sync_lds();
-
-    wmma_h_t q_frag[8];
+    if ((wave >> 2) == g) {
 #pragma unroll
-    for (int d = 0; d < 8; ++d) {
-        q_frag[d] = wmma_ld_h(&kv.sK[(wave * 16 + l16) * LDK + d * 16], hi);
+        for (int d = 0; d < 8; ++d) {
+            q_frag[d] = wmma_ld_h(&kv.sK[(wl * 16 + l16) * LDK + d * 16], hi);
+        }
     }
     sync_lds();
+    }
 
     // 2. Initialize online softmax state (including per-query sink_logit!) and FP32 O accumulators [8][fv8]
     fv8 o_acc[8];
@@ -2312,7 +2320,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
     const float* rb_ptrs[8];
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
-        const int gm = q_blk + wave * 16 + wmma_acc_m(r, lane);
+        const int gm = q_blk + wl * 16 + wmma_acc_m(r, lane);
         row_gm[r] = gm;
         row_pos[r] = base_pos + gm;
         rb_ptrs[r] = (rel_bias && gm < M) ? (rel_bias + (static_cast<size_t>(gm) * n_q_heads + qh) * max_rel) : nullptr;
@@ -2333,7 +2341,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
     // 3. Main FlashAttention-2 loop over KV blocks [kb .. kb + 63]
     for (int kb = k_blk_start; kb <= q_max_pos; kb += BK) {
         // 3A. Load K[64, 128] FP16 into kv.sK[64 * LDK]
-        for (int idx = tid; idx < BK * (HD / 4); idx += 128) {
+        for (int idx = tid; idx < BK * (HD / 4); idx += NT) {
             const int r = idx >> 5;
             const int c4 = idx & 31;
             const int kp = kb + r;
@@ -2435,7 +2443,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
         }
 
         // 3D. Load V[64, 128] transposed into kv.sVt[128 * LDV] (reusing kv LDS!)
-        for (int idx = tid; idx < BK * (HD / 4); idx += 128) {
+        for (int idx = tid; idx < BK * (HD / 4); idx += NT) {
             const int r = idx >> 5;
             const int c4 = idx & 31;
             const int kp = kb + r;

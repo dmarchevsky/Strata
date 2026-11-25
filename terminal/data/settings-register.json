@@ -16594,11 +16594,12 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [
-    "docs/RADEON_780M.md:149"
+    "docs/RADEON_780M.md:149",
+    "docs/RADEON_780M.md:216"
    ],
    "status": "rollback",
    "owner": "backends/hip",
-   "note": "Inkling HIP engine. Unset: on for gfx1103 (Radeon 780M), off elsewhere. One-token decode kernels with the same arithmetic and the same greedy tokens: decode attention with the 3 query heads of a KV head in one block (K/V read once), the experts with D / inter fixed at compile time (gate/up per codec, 4 rows per wave; down 4 rows per wave), and the S_K unembed with the hidden row read into LDS once. DSpark checks: the same GQA attention for the tree, the experts in expert order (L2 sharing), and the verify argmax / draft screen with the codec and D at compile time. Measured on a Ryzen 7 255 / 780M, SQ-15: see RADEON_780M.md. =0 turns it off, =1 on for any HIP card (not measured there).",
+   "note": "Inkling HIP engine. Unset: on for gfx1103 (Radeon 780M), off elsewhere. Kernels with the same arithmetic as before (same output): prompt attention with the 3 query heads of a KV head in one block; one-token decode kernels and the same greedy tokens: decode attention with the 3 query heads of a KV head in one block (K/V read once), the experts with D / inter fixed at compile time (gate/up per codec, 4 rows per wave; down 4 rows per wave), and the S_K unembed with the hidden row read into LDS once. DSpark checks: the same GQA attention for the tree, the experts in expert order (L2 sharing), and the verify argmax / draft screen with the codec and D at compile time. Measured on a Ryzen 7 255 / 780M, SQ-15: see RADEON_780M.md. =0 turns it off, =1 on for any HIP card (not measured there).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -17140,6 +17141,36 @@
    "status": "opt-in",
    "owner": "inkling2",
    "note": "strata-inkling serve (0221 INKSPEED, #6779): N = most prompt tokens read per step while another request decodes (default 0 = off). Moves time between the reader and the decoders; tokens do not change.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_INK_PREFILL_CHUNK",
+   "backends": [
+    "hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
+     "line": 708,
+     "backend": "hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/RADEON_780M.md:213"
+   ],
+   "status": "opt-in",
+   "owner": "backends/hip",
+   "note": "Inkling HIP engine. =N (>= 64): tokens per prompt batch instead of the card's dispatch guard (512 on the Radeon 780M under Linux); the visits between flushes shrink in proportion, so a submission stays as long. Give the engine --chunk N too. 780M, SQ-15: 2048 read prompts 22-25% faster (8K 242 -> 299 tok/s, 32K 208 -> 255); ring check at 2048 ok. See RADEON_780M.md.",
    "retire_after": "",
    "retired_in": ""
   },

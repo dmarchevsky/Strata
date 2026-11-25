@@ -703,6 +703,17 @@ public:
                                         false
 #endif
         );
+        // STRATA_INK_PREFILL_CHUNK=N: tokens per prompt batch instead of the card's guard (512 on the 780M under Linux). Bigger
+        // batches give each expert more rows; the visits between flushes shrink in proportion, so a submission stays as long.
+        if (const char* ev = std::getenv("STRATA_INK_PREFILL_CHUNK"); ev && *ev) {
+            const int v = std::atoi(ev);
+            if (v >= 64) {
+                // keep each submission about as long as the guard's: fewer visits between flushes for a bigger batch
+                if (v > guard_.max_prefill_chunk && guard_.visit_flush_stride > 0)
+                    guard_.visit_flush_stride = std::max(1, guard_.visit_flush_stride * guard_.max_prefill_chunk / v);
+                guard_.max_prefill_chunk = v;
+            }
+        }
 
         // Auto-select FP8_E4M3 KV when high concurrency (>= 16) on <= 32 GiB GPU OR on <= 13 GiB discrete GPUs (8/10/12 GB)
         default_kv_dtype_ = opts.kv_dtype;
@@ -4161,7 +4172,14 @@ private:
             if (is_contiguous_single_slot && B >= 64 && mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
                 // Wave32 WMMA FlashAttention-2 Prefill (BQ=64, BK=64, 27 KB LDS = 2 WG/CU, uint2 V + hoisted rel_bias skip!)
                 const dim3 fgrid(c_.n_head, (B + 63) / 64);
-                if (is_fp8) {
+                if (attn_gqa3_ && !is_fp8) {
+                    // the 3 query heads of a KV head in one block: each K / V tile loaded once (same work per wave)
+                    k3_flash_swa_gqa_prefill_wmma<false, 3><<<dim3(c_.n_head / 3, (B + 63) / 64), 384, 0, stream_>>>(
+                        q, gatea, rbias, sinks, batch.slot_ids[0], batch.pos[0],
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
+                        aout, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
+                } else if (is_fp8) {
                     k3_flash_swa_gqa_prefill_wmma<true><<<fgrid, 128, 0, stream_>>>(
                         q, gatea, rbias, sinks, batch.slot_ids[0], batch.pos[0],
                         reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
