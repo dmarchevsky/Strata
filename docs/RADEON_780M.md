@@ -226,10 +226,22 @@ The ring check (`--ring-check`, 12,000 tokens in 2,048-token batches against one
 1.1e-6, top-1 100%. No GPU reset in the kernel log over these runs (one machine, `cwsr_enable=0`). 1,024 gave 281 tok/s
 at 8K, 4,096 gave 303-306.
 
+The prompt's grouped expert kernels then got a pipelined K loop (same switch): for SF4, S2_K, S3_K and S4_K the next
+step's raw token words and weight bytes are loaded into registers before the current step's matrix products and
+unpacked into a second LDS stage after them, one barrier per step instead of two; the codec is fixed per block at compile
+time. Builds that skipped one part at a time had put the weight unpacking at about 50% of the gate/up kernel and the
+token-row reads at about 35%. The unpacking formulas are the same, so the logits of a 3,000-token prompt stayed
+byte-identical (and SQ-10's greedy ids). Per 2,048-token batch: expert gate/up 2,271 -> 1,740 ms, down 1,111 -> 819 ms;
+prompt 8K 305-312 -> 348-361 tok/s, 32K 281 -> 313-315 tok/s; a 12.7K-token prompt through the server 42.6 s -> 38.3 s.
+Not kept (measured slower or no faster): one launch per codec, 512-thread expert blocks, the prompt attention with K and V
+in separate buffers and 2 barriers per tile instead of 4 (same output, no faster). At the end of a 16K prompt the
+attention's K/V reads are about 40% of its time and its softmax about 19%; the kernel is at 256 VGPRs and 63.5 of
+64 KB LDS, so prefetching the next tile needs a different layout first.
+
 **Repeatable logits for several tokens.** Reading the same 3,000-token prompt ten times gave five different logit dumps
 (6 of 10 alike). The rows that differed were single rows, never their followers, off by at most about 0.05, and two
 launches of the batched unembed (`k_unembed_softcap`) on identical inputs in one process gave a different row about once
-in 1,500 to 15,000 rows. The final hidden rows were identical every time. Pinning the clocks, `-mcumode`, deterministic
+in 1,500 to 15,000 rows. The final hidden rows were identical every time. Pinning the clocks, deterministic
 expert buckets and a second process on the GPU did not remove it. On gfx1103 the several-token unembed now runs on
 `k_unembed_softcap_rows_sk` (each token's row read into LDS once, the same arithmetic): the dumps came out identical
 in 7 of 7 runs, and repeated launches still differed now and then, about 10 times less often. The one-token kernels the
