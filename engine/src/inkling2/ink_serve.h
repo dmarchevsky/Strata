@@ -475,6 +475,7 @@ struct ActiveReq {
     bool slot_read = false;
     // STRATA_INK_SPEC=adapt governor state (measurement experiment, see run_serve_loop)
     int gov_plain_left = 0;    // plain decode steps still to run before the next speculative probe
+    int gov_fails = 0;         // probes in a row that did not pay: the plain run after one doubles (40, 80, 160, 320 steps)
     int gov_calib_left = 0;    // plain steps to run first to learn what one plain step costs
     int gov_win_steps = 0;     // speculative steps in the current window
     int gov_win_emit = 0;      // tokens those steps produced
@@ -522,7 +523,13 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             const double per_step = static_cast<double>(rq.gov_win_emit) / rq.gov_win_steps;
             const double gain = (gov_t_plain > 0.0 && gov_t_spec > 0.0) ? per_step / (gov_t_spec / gov_t_plain) : 2.0;
             rq.gov_gain = (rq.gov_gain < 0.0) ? gain : 0.5 * rq.gov_gain + 0.5 * gain;
-            if (rq.gov_gain < 0.93) { rq.gov_plain_left = 40; rq.gov_gain = -1.0; }
+            if (rq.gov_gain < 0.93) {
+                rq.gov_plain_left = 40 << std::min(rq.gov_fails, 3);
+                rq.gov_fails += 1;
+                rq.gov_gain = -1.0;
+            } else if (rq.gov_gain >= 1.0) {
+                rq.gov_fails = 0;
+            }
             rq.gov_win_steps = 0;
             rq.gov_win_emit = 0;
         }
@@ -731,7 +738,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         rq.cur_pos = reuse;
         rq.hist = rq.prompt_ids;
         rq.next_tok = -1;
-        rq.gov_plain_left = 0; rq.gov_win_steps = 0; rq.gov_win_emit = 0; rq.gov_gain = -1.0;
+        rq.gov_plain_left = 0; rq.gov_win_steps = 0; rq.gov_win_emit = 0; rq.gov_gain = -1.0; rq.gov_fails = 0;
         rq.gov_calib_left = (spec_adapt && gov_t_plain <= 0.0) ? 4 : 0;
         return true;
     };

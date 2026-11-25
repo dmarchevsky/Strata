@@ -16573,6 +16573,36 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_INK_DECODE_780M",
+   "backends": [
+    "hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
+     "line": 769,
+     "backend": "hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/RADEON_780M.md:149"
+   ],
+   "status": "rollback",
+   "owner": "backends/hip",
+   "note": "Inkling HIP engine. Unset: on for gfx1103 (Radeon 780M), off elsewhere. One-token decode kernels with the same arithmetic and the same greedy tokens: decode attention with the 3 query heads of a KV head in one block (K/V read once), the experts with D / inter fixed at compile time (gate/up per codec, 4 rows per wave; down 4 rows per wave), and the S_K unembed with the hidden row read into LDS once. DSpark checks: the same GQA attention for the tree, the experts in expert order (L2 sharing), and the verify argmax / draft screen with the codec and D at compile time. Measured on a Ryzen 7 255 / 780M, SQ-15: see RADEON_780M.md. =0 turns it off, =1 on for any HIP card (not measured there).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_INK_DEC_PCIE_SHARE",
    "backends": [
     "cuda-hip"
@@ -17875,6 +17905,38 @@
    "status": "research",
    "owner": "inkling2/cuda",
    "note": "strata-inkling CUDA hybrid (0221 INKPLACE): path of a routing trace file (which experts each token asked for); diagnostic.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_INK_TRUNK_I8",
+   "backends": [
+    "hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
+     "line": 907,
+     "backend": "hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/RADEON_780M.md:160",
+    "docs/RADEON_780M.md:167",
+    "docs/RADEON_780M.md:174"
+   ],
+   "status": "opt-in",
+   "owner": "backends/hip",
+   "note": "Inkling HIP engine. =1: the one-token step reads Q8 copies (int8 + fp16 scale per 32) of the attention q/r/gate/k/v and wo weights, made at load from the BF16 ones (about 0.65 GB more); the prompt and several-token steps keep BF16. Changes the output. Off with DSpark drafting. See RADEON_780M.md for speed and KL.",
    "retire_after": "",
    "retired_in": ""
   },

@@ -11,6 +11,7 @@
 #pragma once
 
 #include "ink_hip_common.hip.h"
+#include <type_traits>
 
 namespace strata::inkling2::hip {
 
@@ -1920,6 +1921,140 @@ __global__ void __launch_bounds__(256) k_bf16_gemv1_wo_sconv(
     }
 }
 
+// ---- Opt-in 8-bit trunk for the one-token step (STRATA_INK_TRUNK_I8=1; changes the output) ---------------------------
+// A [rows, K] BF16 matrix as Q8_0-like blocks: int8 q[rows * K] then fp16 d[rows * K / 32], w = q * d per 32 values.
+// k_quant_bf16_q8_32: one wave per 32-value block. Grid: (rows * K / 32 + 7) / 8, Block: 256.
+__global__ void __launch_bounds__(256) k_quant_bf16_q8_32(const uint16_t* __restrict__ W, int8_t* __restrict__ q,
+                                                          half_t* __restrict__ d, size_t n_blocks) {
+    const size_t blk = static_cast<size_t>(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (blk >= n_blocks) return;
+    const float w = bf16_to_f32(W[blk * 32 + lane]);
+    const float amax = wave32_max(fabsf(w));
+    const float dd = amax / 127.0f;
+    const half_t dh = static_cast<half_t>(dd);
+    const float dq = static_cast<float>(dh);
+    const float inv = dq > 0.0f ? 1.0f / dq : 0.0f;
+    q[blk * 32 + lane] = static_cast<int8_t>(max(-127, min(127, __float2int_rn(w * inv))));
+    if (lane == 0) d[blk] = dh;
+}
+
+// 8 weights of row wr at column k (k % 8 == 0) of a Q8 matrix: w[i] = q[i] * d[k / 32]
+__device__ __forceinline__ void q8_ld8(const int8_t* __restrict__ qr, const half_t* __restrict__ dr, int k, float (&w)[8]) {
+    const uint2 raw = *reinterpret_cast<const uint2*>(qr + k);
+    const float dd = static_cast<float>(dr[k >> 5]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        w[i] = static_cast<float>(static_cast<int8_t>((raw.x >> (8 * i)) & 0xFFu)) * dd;
+        w[4 + i] = static_cast<float>(static_cast<int8_t>((raw.y >> (8 * i)) & 0xFFu)) * dd;
+    }
+}
+
+// one row of a one-token Q8 GEMV against X in LDS (K % 8 == 0): 8 weights per lane per step
+__device__ __forceinline__ float q8_row_dot(const int8_t* __restrict__ qr, const half_t* __restrict__ dr,
+                                            const float* __restrict__ sX, int K, int lane) {
+    float acc0 = 0.0f, acc1 = 0.0f;
+    int k = lane * 8;
+    for (; k + 256 < K; k += 512) {
+        float wa[8], wb[8];
+        q8_ld8(qr, dr, k, wa);
+        q8_ld8(qr, dr, k + 256, wb);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { acc0 = fmaf(wa[i], sX[k + i], acc0); acc1 = fmaf(wb[i], sX[k + 256 + i], acc1); }
+    }
+    if (k < K) {
+        float wa[8];
+        q8_ld8(qr, dr, k, wa);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc0 = fmaf(wa[i], sX[k + i], acc0);
+    }
+    return wave32_sum(acc0 + acc1);
+}
+
+// Y[N] = W[N, K] X[K] for one token, W in Q8 (rows of the matrix from row_off on). Grid: (N + 7) / 8, Block: 256.
+__global__ void __launch_bounds__(256) k_q8_gemv1(const int8_t* __restrict__ Wq, const half_t* __restrict__ Wd,
+                                                  int row_off, const float* __restrict__ X, float* __restrict__ Y,
+                                                  int N, int K) {
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int row = blockIdx.x * 8 + wave;
+    __shared__ alignas(16) float sX[4096];
+    for (int i = tid; i < (K >> 2); i += 256) reinterpret_cast<float4*>(sX)[i] = reinterpret_cast<const float4*>(X)[i];
+    __syncthreads();
+    if (row >= N) return;
+    const size_t r = static_cast<size_t>(row_off + row);
+    const float sum = q8_row_dot(Wq + r * K, Wd + r * (K >> 5), sX, K, lane);
+    if (lane == 0) Y[row] = sum;
+}
+
+// k_bf16_gemv1_qkvrg with the [q; r; gate; k; v] matrix in Q8 (the F32 sink rows as before). Grid: ((tot_n + n_sink + 7) / 8).
+__global__ void __launch_bounds__(256) k_q8_gemv1_qkvrg(
+    const int8_t* __restrict__ Wq, const half_t* __restrict__ Wd, const float* __restrict__ X,
+    float* __restrict__ Q, float* __restrict__ R, float* __restrict__ G, float* __restrict__ K_out, float* __restrict__ V_out,
+    const float* __restrict__ W_sink, float* __restrict__ Sinks_out, int q_dim, int r_dim, int kv_dim, int tot_n, int n_sink, int K) {
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int row = blockIdx.x * 8 + wave;
+    __shared__ alignas(16) float sX[4096];
+    const int k4 = K >> 2;
+    const float4* sx4 = reinterpret_cast<const float4*>(sX);
+    for (int i = tid; i < k4; i += 256) reinterpret_cast<float4*>(sX)[i] = reinterpret_cast<const float4*>(X)[i];
+    __syncthreads();
+    if (row >= tot_n + n_sink) return;
+    if (row >= tot_n) {
+        const int sr = row - tot_n;
+        const float4* w4 = reinterpret_cast<const float4*>(W_sink + static_cast<size_t>(sr) * K);
+        float acc = 0.0f;
+        for (int i = lane; i < k4; i += 32) {
+            const float4 wv = w4[i];
+            const float4 xv = sx4[i];
+            acc = fmaf(wv.x, xv.x, fmaf(wv.y, xv.y, fmaf(wv.z, xv.z, fmaf(wv.w, xv.w, acc))));
+        }
+        const float sum = wave32_sum(acc);
+        if (lane == 0) Sinks_out[sr] = sum;
+        return;
+    }
+    const float sum = q8_row_dot(Wq + static_cast<size_t>(row) * K, Wd + static_cast<size_t>(row) * (K >> 5), sX, K, lane);
+    if (lane == 0) {
+        if (row < q_dim) Q[row] = sum;
+        else if (row < q_dim + r_dim) R[row - q_dim] = sum;
+        else if (row < 2 * q_dim + r_dim) G[row - (q_dim + r_dim)] = sum;
+        else if (K_out && row < 2 * q_dim + r_dim + kv_dim) K_out[row - (2 * q_dim + r_dim)] = sum;
+        else if (V_out) V_out[row - (2 * q_dim + r_dim + kv_dim)] = sum;
+    }
+}
+
+// k_bf16_gemv1_wo_sconv with wo in Q8 (same ShortConv / residual epilogue). Grid: ((D + 7) / 8), Block: 256.
+__global__ void __launch_bounds__(256) k_q8_gemv1_wo_sconv(
+    const int8_t* __restrict__ Wq, const half_t* __restrict__ Wd, const float* __restrict__ X,
+    const float* __restrict__ static_w, const int32_t* __restrict__ slot_ids, uint16_t* __restrict__ hist_pool,
+    float* __restrict__ cur, float* __restrict__ blk_save, int D, int K) {
+#pragma clang fp contract(off)
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int row = blockIdx.x * 8 + wave;
+    __shared__ alignas(16) float sX[4096];
+    for (int i = tid; i < (K >> 2); i += 256) reinterpret_cast<float4*>(sX)[i] = reinterpret_cast<const float4*>(X)[i];
+    __syncthreads();
+    if (row >= D) return;
+    const float x0 = q8_row_dot(Wq + static_cast<size_t>(row) * K, Wd + static_cast<size_t>(row) * (K >> 5), sX, K, lane);
+    if (lane == 0) {
+        const int slot = slot_ids[0];
+        uint16_t* h_slot = hist_pool + static_cast<size_t>(slot) * 3 * D;
+        const float h0 = bf16_to_f32(h_slot[0 * D + row]);
+        const float h1 = bf16_to_f32(h_slot[1 * D + row]);
+        const float h2 = bf16_to_f32(h_slot[2 * D + row]);
+        const float4 sw = *reinterpret_cast<const float4*>(static_w + static_cast<size_t>(row) * 4);
+        const float y = (x0 + sw.x * h0 + sw.y * h1 + sw.z * h2 + sw.w * x0) * 0.44721359549995793f;
+        h_slot[0 * D + row] = h_slot[1 * D + row];
+        h_slot[1 * D + row] = h_slot[2 * D + row];
+        h_slot[2 * D + row] = f32_to_bf16(x0);
+        if (blk_save != nullptr) {
+            blk_save[row] = cur[row];
+            cur[row] = y;
+        } else {
+            cur[row] += y;
+        }
+    }
+}
+
 // Wave-6C High-Occupancy Small-N FP32 GEMV (1 block of 256 threads per output row -> 128 blocks for router, 24 for sink!)
 // Saturates ALL 40-64 CUs on R9700 & Strix Halo (8x higher occupancy than 16-block k_f32_gemv!)
 // Grid: (N, M), Block: 256
@@ -3077,25 +3212,270 @@ __global__ void __launch_bounds__(256) k_moe_direct_w13_situ(
     }
 }
 
+// One row of k_moe_direct_w13_situ's dot product, the same statements as its codec branches. C >= 0 fixes the codec
+// at compile time (one branch left, the registers of that branch only); C = -1 reads it from desc.
+template <int C>
+__device__ __forceinline__ float w13_row_dot(const GpuExpertDesc& desc, int row, const half_t* __restrict__ xsrc, int lane,
+                                             int D, int inter, const half_t* s_e4m3, const uint32_t* s_sf4_pair,
+                                             const float* s_sf4_sc) {
+    const int code = C >= 0 ? C : static_cast<int>(desc.gu_code);
+    float acc = 0.0f;
+    if (code == CODE_SF4) {
+        const float* hdr = reinterpret_cast<const float*>(desc.body);
+        const float outer = hdr[0] / hdr[1];
+        const uint8_t* packed = desc.body + 16;
+        const uint8_t* scales = packed + static_cast<size_t>(2 * inter) * (D >> 1);
+        const uint8_t* pr = packed + static_cast<size_t>(row) * (D >> 1);
+        const uint8_t* sr = scales + static_cast<size_t>(row) * (D >> 4);
+        const int nblk = D >> 4;
+        for (int blk = lane; blk < nblk; blk += 32) {
+            const float sc = s_sf4_sc[sr[blk]] * outer;
+            const uint2 raw = *reinterpret_cast<const uint2*>(pr + blk * 8);
+            const uint4 x0 = *reinterpret_cast<const uint4*>(xsrc + (blk << 4));
+            const uint4 x1 = *reinterpret_cast<const uint4*>(xsrc + (blk << 4) + 8);
+            float d = fdot2_f32(s_sf4_pair[raw.x & 0xFFu], x0.x, 0.0f);
+            d = fdot2_f32(s_sf4_pair[(raw.x >> 8) & 0xFFu], x0.y, d);
+            d = fdot2_f32(s_sf4_pair[(raw.x >> 16) & 0xFFu], x0.z, d);
+            d = fdot2_f32(s_sf4_pair[(raw.x >> 24) & 0xFFu], x0.w, d);
+            d = fdot2_f32(s_sf4_pair[raw.y & 0xFFu], x1.x, d);
+            d = fdot2_f32(s_sf4_pair[(raw.y >> 8) & 0xFFu], x1.y, d);
+            d = fdot2_f32(s_sf4_pair[(raw.y >> 16) & 0xFFu], x1.z, d);
+            d = fdot2_f32(s_sf4_pair[(raw.y >> 24) & 0xFFu], x1.w, d);
+            acc = fmaf(d, sc, acc);
+        }
+    } else if (code == CODE_MX8) {
+        const uint8_t* W = desc.body;
+        const uint8_t* S = W + static_cast<size_t>(2 * inter) * D;
+        const uint8_t* wr = W + static_cast<size_t>(row) * D;
+        const uint8_t* sr = S + static_cast<size_t>(row) * (D >> 5);
+        const int nblk = D >> 5;
+        for (int blk = lane; blk < nblk; blk += 32) {
+            const float sc = ue8m0_to_f32(sr[blk]);
+            const uint8_t* wb = wr + (blk << 5);
+            const uint4* xp = reinterpret_cast<const uint4*>(xsrc + (blk << 5));
+            float d = 0.0f;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const uint4 xv = xp[q];
+                const hv2 h0 = {s_e4m3[wb[q*8+0]], s_e4m3[wb[q*8+1]]};
+                const hv2 h1 = {s_e4m3[wb[q*8+2]], s_e4m3[wb[q*8+3]]};
+                const hv2 h2 = {s_e4m3[wb[q*8+4]], s_e4m3[wb[q*8+5]]};
+                const hv2 h3 = {s_e4m3[wb[q*8+6]], s_e4m3[wb[q*8+7]]};
+                d = fdot2_f32(__builtin_bit_cast(uint32_t, h0), xv.x, d);
+                d = fdot2_f32(__builtin_bit_cast(uint32_t, h1), xv.y, d);
+                d = fdot2_f32(__builtin_bit_cast(uint32_t, h2), xv.z, d);
+                d = fdot2_f32(__builtin_bit_cast(uint32_t, h3), xv.w, d);
+            }
+            acc = fmaf(d, sc, acc);
+        }
+    } else if (code == CODE_GGUF_RAW) {
+        const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+        const uint32_t gt = hdr->gu_type;
+        const size_t rb = hip_gguf_row_bytes(gt, D);
+        const int src_row = (hdr->flags & 1u) ? row : (((row & 1) ? inter : 0) + (row >> 1));
+        const float ext_sc = (row & 1) ? hdr->up_scale : hdr->gate_scale;
+        const uint8_t* wr = desc.body + 32 + static_cast<size_t>(src_row) * rb;
+        const int n8 = D >> 3;
+        for (int u = lane; u < n8; u += 32) {
+            const uint4 wv = hip_gguf_decode_8_f16(gt, wr, u << 3, ext_sc);
+            const uint4 xv = *reinterpret_cast<const uint4*>(xsrc + (u << 3));
+            float d = fdot2_f32(wv.x, xv.x, acc);
+            d = fdot2_f32(wv.y, xv.y, d);
+            d = fdot2_f32(wv.z, xv.z, d);
+            acc = fdot2_f32(wv.w, xv.w, d);
+        }
+    } else if (code == CODE_S2_K) {
+        const uint8_t* gu_ptr = desc.body + static_cast<size_t>(inter) * 2;
+        const int nsb = D >> 8;
+        const uint8_t* wr = gu_ptr + static_cast<size_t>(row) * nsb * 70;
+        const int j0 = lane * 8;
+        const int sub = j0 >> 6;
+        for (int s = 0; s < nsb; ++s) {
+            const uint8_t* blk = wr + static_cast<size_t>(s) * 70;
+            const float eff = decode_sk_sub_eff_i8(blk, CODE_S2_K, sub);
+            const uint4 xv = *reinterpret_cast<const uint4*>(xsrc + (s << 8) + j0);
+            const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S2_K, j0);
+            float d = fdot2_f32(wv.x, xv.x, 0.0f);
+            d = fdot2_f32(wv.y, xv.y, d);
+            d = fdot2_f32(wv.z, xv.z, d);
+            d = fdot2_f32(wv.w, xv.w, d);
+            acc = fmaf(d, eff, acc);
+        }
+    } else if (code == CODE_S3_K) {
+        const uint8_t* gu_ptr = desc.body + static_cast<size_t>(inter) * 2;
+        const int nsb = D >> 8;
+        const uint8_t* wr = gu_ptr + static_cast<size_t>(row) * nsb * 102;
+        const int j0 = lane * 8;
+        const int sub = j0 >> 6;
+        for (int s = 0; s < nsb; ++s) {
+            const uint8_t* blk = wr + static_cast<size_t>(s) * 102;
+            const float eff = decode_sk_sub_eff_i8(blk, CODE_S3_K, sub);
+            const uint4 xv = *reinterpret_cast<const uint4*>(xsrc + (s << 8) + j0);
+            const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S3_K, j0);
+            float d = fdot2_f32(wv.x, xv.x, 0.0f);
+            d = fdot2_f32(wv.y, xv.y, d);
+            d = fdot2_f32(wv.z, xv.z, d);
+            d = fdot2_f32(wv.w, xv.w, d);
+            acc = fmaf(d, eff, acc);
+        }
+    } else {
+        const uint8_t* gu_ptr = desc.body + static_cast<size_t>(inter) * 2;
+        const int nsb = D >> 8;
+        const int sb_b = sk_sb_bytes(code);
+        const uint8_t* wr = gu_ptr + static_cast<size_t>(row) * nsb * sb_b;
+        const int j0 = lane * 8;
+        const int sub = j0 >> 6;
+        for (int s = 0; s < nsb; ++s) {
+            const uint8_t* blk = wr + static_cast<size_t>(s) * sb_b;
+            const float eff = decode_sk_sub_eff_i8(blk, code, sub);
+            const uint4 xv = *reinterpret_cast<const uint4*>(xsrc + (s << 8) + j0);
+            const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, code, j0);
+            float d = fdot2_f32(wv.x, xv.x, 0.0f);
+            d = fdot2_f32(wv.y, xv.y, d);
+            d = fdot2_f32(wv.z, xv.z, d);
+            d = fdot2_f32(wv.w, xv.w, d);
+            acc = fmaf(d, eff, acc);
+        }
+    }
+
+    return acc;
+}
+
+// k_moe_direct_w13_situ for D = 2304, inter = 1152 with the codec chosen once per block (one expert per block) and R inter
+// indices per wave (wave 2k: gate rows 2j, 2k+1: up rows 2j+1, j = j0 .. j0+R-1). Same arithmetic per row and the same SITU.
+// W (waves per SIMD the compiler must leave room for) keeps the unrolled rows from taking all the registers: on the 780M
+// R = 4, W = 16 measured 16.95 ms per token against 19.6 for the one-row kernel (R = 2 / 4 without the cap: 30 ms).
+// Grid: (1152 / (4R), B * top_k), Block: 256.
+// kPerm: grid swapped to (B * top_k, 1152 / (4R)) and blockIdx.x indexes perm (the (row, expert) pairs sorted by expert),
+// so the blocks that read the same rows of the same expert run one after another and share them in L2 (same arithmetic).
+template <int R, int W = 10, bool kPerm = false>
+__global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(R > 1 ? W : 1))) k_moe_direct_w13_situ_fx(
+    const GpuExpertDesc* __restrict__ exps,
+    const int32_t* __restrict__ topk_ids,
+    const half_t* __restrict__ X_f16,
+    half_t* __restrict__ act_out,
+    int B, int top_k, float beta, float lb, const int32_t* __restrict__ perm = nullptr) {
+    constexpr int D = 2304, inter = 1152;
+    const int slot_k = kPerm ? perm[blockIdx.x] : static_cast<int>(blockIdx.y);
+    const int bx = kPerm ? static_cast<int>(blockIdx.y) : static_cast<int>(blockIdx.x);
+    if (slot_k >= B * top_k) return;
+    const int b = slot_k / top_k;
+    const int eid = topk_ids[slot_k];
+    const GpuExpertDesc desc = exps[eid];
+    if (!desc.body) return;
+
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int j0 = (bx * 4 + (wave >> 1)) * R;
+    const half_t* xrow = X_f16 + static_cast<size_t>(b) * D;
+
+    __shared__ alignas(16) half_t sX[2304];
+    __shared__ half_t s_e4m3[256];
+    __shared__ uint32_t s_sf4_pair[256];
+    __shared__ float s_sf4_sc[256];
+    {
+        const uint4* x8 = reinterpret_cast<const uint4*>(xrow);
+        uint4* sx8 = reinterpret_cast<uint4*>(sX);
+        for (int i = tid; i < (D >> 3); i += 256) sx8[i] = x8[i];
+    }
+    if (desc.gu_code == CODE_MX8) {
+        s_e4m3[tid] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>(tid)));
+    } else if (desc.gu_code == CODE_SF4) {
+        const hv2 hp = {sf4_e2m1_f16(static_cast<uint32_t>(tid) & 15u), sf4_e2m1_f16(static_cast<uint32_t>(tid) >> 4)};
+        s_sf4_pair[tid] = __builtin_bit_cast(uint32_t, hp);
+        s_sf4_sc[tid] = e4m3fn_to_f32(static_cast<uint8_t>(tid));
+    }
+    __syncthreads();
+    if (j0 >= inter) return;
+
+    float accs[R];
+    auto rows = [&](auto ctag) {
+        constexpr int C = decltype(ctag)::value;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = ((j0 + r) << 1) | (wave & 1);
+            accs[r] = w13_row_dot<C>(desc, row, sX, lane, D, inter, s_e4m3, s_sf4_pair, s_sf4_sc);
+        }
+    };
+    switch (desc.gu_code) {
+        case CODE_SF4:  rows(std::integral_constant<int, CODE_SF4>{}); break;
+        case CODE_S3_K: rows(std::integral_constant<int, CODE_S3_K>{}); break;
+        case CODE_S4_K: rows(std::integral_constant<int, CODE_S4_K>{}); break;
+        case CODE_S2_K: rows(std::integral_constant<int, CODE_S2_K>{}); break;
+        default:
+            // any other codec: one row at a time (not unrolled), so its registers do not set the kernel's
+#pragma unroll 1
+            for (int r = 0; r < R; ++r) {
+                const int row = ((j0 + r) << 1) | (wave & 1);
+                accs[r] = w13_row_dot<-1>(desc, row, sX, lane, D, inter, s_e4m3, s_sf4_pair, s_sf4_sc);
+            }
+            break;
+    }
+
+    __shared__ float s_gu[8 * R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float val = wave32_sum(accs[r]);
+        if (lane == 0) s_gu[wave * R + r] = val;
+    }
+    __syncthreads();
+    if (lane == 0 && (wave & 1) == 0) {
+        for (int r = 0; r < R; ++r) {
+            const int j = j0 + r;
+            const float g = s_gu[wave * R + r];
+            const float u = s_gu[(wave + 1) * R + r];
+            float v = situ_f32(g, u, beta, lb);
+            if (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8 && desc.dn_code != CODE_GGUF_RAW) {
+                const float sq = static_cast<float>(reinterpret_cast<const half_t*>(desc.body)[j]);
+                v /= sq;
+            }
+            act_out[static_cast<size_t>(slot_k) * inter + j] = static_cast<half_t>(v);
+        }
+    }
+}
+
+// perm[0 .. n_pairs) = the (row, expert) pair indices ordered by expert id, ties by pair index. One block, n_pairs <= 256.
+__global__ void __launch_bounds__(256) k_moe_pairs_by_expert(const int32_t* __restrict__ topk_ids, int32_t* __restrict__ perm,
+                                                             int n_pairs) {
+    const int i = threadIdx.x;
+    if (i >= n_pairs) return;
+    const int e = topk_ids[i];
+    int rank = 0;
+    for (int j = 0; j < n_pairs; ++j) {
+        const int ej = topk_ids[j];
+        rank += (ej < e) || (ej == e && j < i);
+    }
+    perm[rank] = i;
+}
+
 // Stage 2A (Wave-6): Parallel-Expert w2 across all (b, k) active experts -> 8x more blocks (2,304 at B=1!),
 // LDS-cached sA[1024] (2 KB shared by all 8 waves), 1 KB SF4 LUT, zero-switch S2_K/S3_K hot loops!
 // Grid: ((D + 7) / 8, B * top_k), Block: 256
+// KD / KI > 0 fix D / inter at compile time (they must equal the D / inter passed) and KRPW rows per wave: same arithmetic.
+template <int KD = 0, int KI = 0, int KRPW = 1, bool kPerm = false>
 __global__ void __launch_bounds__(256) k_moe_direct_w2_par(
     const GpuExpertDesc* __restrict__ exps,   // [128]
     const int32_t* __restrict__ topk_ids,     // [B, top_k]
     const half_t* __restrict__ act_in,        // [B * top_k, inter]
     float* __restrict__ y_part,               // [B * top_k, D] (reuses sc_bucket_y_!)
-    int B, int top_k, int D, int inter) {
-    const int slot_k = blockIdx.y;
+    int B, int top_k, int D_rt, int inter_rt, const int32_t* __restrict__ perm = nullptr) {
+    // kPerm: as k_moe_direct_w13_situ_fx (grid (B * top_k, row blocks), pairs in expert order; same arithmetic)
+    const int D = KD > 0 ? KD : D_rt;
+    const int inter = KI > 0 ? KI : inter_rt;
+    const int slot_k = kPerm ? perm[blockIdx.x] : static_cast<int>(blockIdx.y);
+    const int bx = kPerm ? static_cast<int>(blockIdx.y) : static_cast<int>(blockIdx.x);
     if (slot_k >= B * top_k) return;
     const int eid = topk_ids[slot_k];
     const GpuExpertDesc desc = exps[eid];
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
     const int lane = tid & 31;
-    const int row = blockIdx.x * 8 + wave;
+    constexpr int R = (KD > 0) ? KRPW : 1;                // rows per wave (R = 1 unless KD is fixed)
+    const int row0 = (bx * 8 + wave) * R;
     if (!desc.body) {
-        if (lane == 0 && row < D) y_part[static_cast<size_t>(slot_k) * D + row] = 0.0f;
+        for (int r = 0; r < R; ++r)
+            if (lane == 0 && row0 + r < D) y_part[static_cast<size_t>(slot_k) * D + row0 + r] = 0.0f;
         return;
     }
 
@@ -3119,8 +3499,12 @@ __global__ void __launch_bounds__(256) k_moe_direct_w2_par(
         s_sf4_sc[tid] = e4m3fn_to_f32(static_cast<uint8_t>(tid));
     }
     __syncthreads();
-    if (row >= D) return;
+    if (row0 >= D) return;
     const half_t* asrc = use_sa ? sA : arow;
+    float accs[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+    const int row = row0 + r;
     float acc = 0.0f;
 
     if (desc.dn_code == CODE_SF4) {
@@ -3262,9 +3646,14 @@ __global__ void __launch_bounds__(256) k_moe_direct_w2_par(
             }
         }
     }
+    accs[r] = acc;
+    }
 
-    const float yk = wave32_sum(acc);
-    if (lane == 0) y_part[static_cast<size_t>(slot_k) * D + row] = yk;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float yk = wave32_sum(accs[r]);
+        if (lane == 0) y_part[static_cast<size_t>(slot_k) * D + row0 + r] = yk;
+    }
 }
 
 // Stage 2B (Wave-6): Deterministic weighted reduction across top_k=8 partial expert outputs in L2!

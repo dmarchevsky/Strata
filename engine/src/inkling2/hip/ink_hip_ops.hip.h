@@ -2048,6 +2048,138 @@ __global__ void __launch_bounds__(256) k3_flash_splitkv_part(
     }
 }
 
+// Stage 1 with the G query heads of one KV head in one block: each wave reads a key / value once and runs the G heads'
+// online softmax side by side. Per head the same split, the same walk (kp = sp_beg + wave, step 8), the same operations
+// in the same order and the same partials as k3_flash_splitkv_part, so k3_flash_splitkv_reduce (and the tree kernel's
+// #6671 contract) are unchanged; only the K / V reads drop to 1 / G. Grid = (n_kv_heads, M, KSPLITS), Block = 256.
+template <bool FP8_KV, int KSPLITS, int G>
+__global__ void __launch_bounds__(256) k3_flash_splitkv_part_gqa(
+    const float* __restrict__ Q,
+    const float* __restrict__ rel_bias,
+    const float* __restrict__ sink_logit,
+    const int32_t* __restrict__ slot_ids,
+    const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ page_table,
+    int max_pages_per_slot,
+    const void* __restrict__ k_pool,
+    const void* __restrict__ v_pool,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    float* __restrict__ partials,           // [M, n_q_heads, KSPLITS, 130]
+    int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int kvh = blockIdx.x;
+    const int m = blockIdx.y;
+    const int sp = blockIdx.z;
+    if (kvh >= n_kv_heads || m >= M || sp >= KSPLITS) return;
+
+    const int d0 = lane * 4;
+    const int slot = slot_ids[m];
+    const int cur_pos = pos[m];
+    const int k_start = (swa_window > 0 && cur_pos >= swa_window) ? (cur_pos - swa_window + 1) : 0;
+    const int total_kv = cur_pos - k_start + 1;
+    const int chunk = (total_kv + KSPLITS - 1) / KSPLITS;
+    const int sp_beg = k_start + sp * chunk;
+    const int sp_end = min(cur_pos + 1, sp_beg + chunk);
+
+    const float scale = rsqrtf(128.0f);
+    float q0[G], q1[G], q2[G], q3[G], max_l[G], sum_exp[G], o0[G], o1[G], o2[G], o3[G];
+    const float* rb_row[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const int qh = kvh * G + g;
+        const float4 qv = *reinterpret_cast<const float4*>(Q + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0);
+        q0[g] = qv.x * scale; q1[g] = qv.y * scale; q2[g] = qv.z * scale; q3[g] = qv.w * scale;
+        max_l[g] = (sp == 0 && wave == 0 && sink_logit) ? sink_logit[static_cast<size_t>(m) * n_q_heads + qh] : -1e30f;
+        sum_exp[g] = (sp == 0 && wave == 0 && sink_logit) ? 1.0f : 0.0f;
+        o0[g] = 0.0f; o1[g] = 0.0f; o2[g] = 0.0f; o3[g] = 0.0f;
+        rb_row[g] = rel_bias ? (rel_bias + (static_cast<size_t>(m) * n_q_heads + qh) * max_rel) : nullptr;
+    }
+
+    const int elems = n_kv_heads * 128;
+    const int kv_off = kvh * 128 + d0;
+    const int32_t* pt_row = page_table + slot * max_pages_per_slot;
+
+    for (int kp = sp_beg + wave; kp < sp_end; kp += 8) {
+        const int ring_p = (swa_window > 0) ? (kp % swa_ring) : kp;
+        const int phys = pt_row[ring_p >> 6];
+        const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
+        const size_t base = tok_base * elems + kv_off;
+
+        float k0, k1, k2, k3, v0, v1, v2, v3;
+        if constexpr (FP8_KV) {
+            const float ks = k_scales ? k_scales[tok_base] : 1.0f;
+            const float vs = v_scales ? v_scales[tok_base] : 1.0f;
+            const uint32_t kw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(k_pool) + base);
+            const uint32_t vw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(v_pool) + base);
+            k0 = e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks;
+            k1 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks;
+            k2 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks;
+            k3 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks;
+            v0 = e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs;
+            v1 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs;
+            v2 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs;
+            v3 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs;
+        } else {
+            const uint2 kw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(k_pool) + base);
+            const uint2 vw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(v_pool) + base);
+            h2_unpack(kw.x, k0, k1); h2_unpack(kw.y, k2, k3);
+            h2_unpack(vw.x, v0, v1); h2_unpack(vw.y, v2, v3);
+        }
+        const int dist = cur_pos - kp;
+
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float sc = wave32_sum(fmaf(q0[g], k0, fmaf(q1[g], k1, fmaf(q2[g], k2, q3[g] * k3))));
+            if (rb_row[g] && dist < max_rel) sc += rb_row[g][dist];
+
+            const float new_max = fmaxf(max_l[g], sc);
+            const float alpha = __expf(max_l[g] - new_max);
+            const float beta = __expf(sc - new_max);
+            o0[g] = fmaf(o0[g], alpha, beta * v0);
+            o1[g] = fmaf(o1[g], alpha, beta * v1);
+            o2[g] = fmaf(o2[g], alpha, beta * v2);
+            o3[g] = fmaf(o3[g], alpha, beta * v3);
+            sum_exp[g] = fmaf(sum_exp[g], alpha, beta);
+            max_l[g] = new_max;
+        }
+    }
+
+    __shared__ float s_max[G][8];
+    __shared__ float s_sum[G][8];
+    __shared__ alignas(16) float4 s_o[G][8][32];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        if (lane == 0) { s_max[g][wave] = max_l[g]; s_sum[g][wave] = sum_exp[g]; }
+        s_o[g][wave][lane] = make_float4(o0[g], o1[g], o2[g], o3[g]);
+    }
+    __syncthreads();
+
+    if (wave < G) {
+        const int g = wave;
+        const int qh = kvh * G + g;
+        float gmax = -1e30f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) gmax = fmaxf(gmax, s_max[g][w]);
+        float tot_s = 0.0f;
+        float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            if (s_sum[g][w] > 0.0f) {
+                const float wt = __expf(s_max[g][w] - gmax);
+                tot_s += wt * s_sum[g][w];
+                const float4 p = s_o[g][w][lane];
+                r0 = fmaf(wt, p.x, r0); r1 = fmaf(wt, p.y, r1);
+                r2 = fmaf(wt, p.z, r2); r3 = fmaf(wt, p.w, r3);
+            }
+        }
+        float* dst = partials + ((static_cast<size_t>(m) * n_q_heads + qh) * KSPLITS + sp) * 130;
+        *reinterpret_cast<float4*>(dst + d0) = make_float4(r0, r1, r2, r3);
+        if (lane == 0) { dst[128] = gmax; dst[129] = tot_s; }
+    }
+}
+
 // Stage 2: Merges KSPLITS partials + applies sigmoid(gate_attn) (< 5 us!)
 // Grid = (n_q_heads, M), Block = 32 (1 wave = 128 dims!)
 template <int KSPLITS = 4>
@@ -3333,6 +3465,56 @@ __global__ void __launch_bounds__(256) k_unembed_softcap(
     }
 }
 
+// One-token unembed + softcap for an S_K table (decode, n_want == 1): the whole h_norm row goes into LDS once, then each
+// wave reads R vocab rows superblock by superblock with no barrier in between. Per row the same arithmetic in the same
+// order as k_unembed_softcap. kCode > 0 fixes the code at compile time. Grid: ((V + 8R - 1) / (8R)), Block: 256.
+template <int kCode, int R>
+__global__ void __launch_bounds__(256) k_unembed_softcap_one_sk(
+    const uint8_t* __restrict__ unemb_raw, int fmt,
+    const float* __restrict__ h_norm,       // [B, D]
+    const int32_t* __restrict__ want_idx,   // [1]
+    float* __restrict__ logits_out,         // [1, V]
+    int V, int D, float softcap) {
+    const int code = kCode > 0 ? kCode : fmt;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int v0 = (blockIdx.x * 8 + wave) * R;
+    const int sb_b = sk_sb_bytes(code);
+    const int nsb = D >> 8;
+    const float* h = h_norm + static_cast<size_t>(want_idx[0]) * D;
+    __shared__ alignas(16) half_t sH[16 * 256];
+    for (int i = tid; i < (nsb << 8); i += 256) sH[i] = static_cast<half_t>(h[i]);
+    __syncthreads();
+    const int j0 = lane * 8;
+    const int sub = j0 >> 6;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    for (int s = 0; s < nsb; ++s) {
+        const uint4 hv = *reinterpret_cast<const uint4*>(&sH[(s << 8) + j0]);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (v0 + r < V) {
+                const uint8_t* blk = unemb_raw + (static_cast<size_t>(v0 + r) * nsb + s) * sb_b;
+                const float eff = decode_sk_sub_eff_i8(blk, code, sub);
+                const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, code, j0);
+                float d = fdot2_f32(wv.x, hv.x, 0.0f);
+                d = fdot2_f32(wv.y, hv.y, d);
+                d = fdot2_f32(wv.z, hv.z, d);
+                d = fdot2_f32(wv.w, hv.w, d);
+                acc[r] = fmaf(d, eff, acc[r]);
+            }
+        }
+    }
+    const float inv_cap = 1.0f / softcap;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float z = wave32_sum(acc[r]);
+        if (lane == 0 && v0 + r < V) logits_out[v0 + r] = softcap * tanhf(z * inv_cap);
+    }
+}
+
 // Multi-format DSpark combined unembed argmax stage 1: computes dot(unemb[v], combined) for all V, deterministic first-max!
 // Uses LDS-cached FP16 combined vector + fast 32-bit S_K unpack + fdot2_f32 for 3x faster Markov drafting!
 __global__ void __launch_bounds__(256) k5_dspark_packed_argmax_stage1(
@@ -3435,13 +3617,19 @@ __global__ void __launch_bounds__(256) k5_dspark_packed_argmax_stage1(
 // Single-Pass Multi-Step DSpark Base Unembed Top-2 Candidate Screen (7x LESS UNEMBED BANDWIDTH!!):
 // Reads unembed[V, D] ONCE across ALL n_draft (<= 7) cur[1..n_draft] rows simultaneously!
 // Grid: (512,), Block: 256 (8 waves/block) -> writes top-2 (val, id) per block = 1,024 top candidates per step!
+// KCODE / KD / KT > 0 fix the codec / D / n_draft at compile time (they must equal the values passed): the loops unroll and
+// issue their loads together. Same arithmetic.
+template <int KCODE = 0, int KD = 0, int KT = 0>
 __global__ void __launch_bounds__(256) k5_dspark_base_top2_screen(
     const uint8_t* __restrict__ unemb_raw,
-    int fmt, int vocab_rows,
+    int fmt_rt, int vocab_rows,
     const float* __restrict__ cur_steps,    // [n_draft, D] (cur + 1 * D)
     float* __restrict__ cand_val,           // [n_draft, gridDim.x * 2]
     int32_t* __restrict__ cand_id,          // [n_draft, gridDim.x * 2]
-    int n_draft, int D, int V) {
+    int n_draft_rt, int D_rt, int V) {
+    const int fmt = KCODE > 0 ? KCODE : fmt_rt;
+    const int D = KD > 0 ? KD : D_rt;
+    const int n_draft = KT > 0 ? KT : n_draft_rt;
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
     const int lane = tid & 31;

@@ -761,6 +761,15 @@ public:
         if (const char* ev = std::getenv("STRATA_HIP_MOE_I8")) {
             use_i8_moe_wmma_ = (std::atoi(ev) != 0);
         }
+        // One-token decode kernels, same arithmetic and same results as the general ones: the experts (B <= 4) with
+        // D / inter fixed at compile time and 4 down-projection rows per wave, and the unembed of an S_K table with the
+        // hidden row read into LDS once (k_unembed_softcap_one_sk). On by default on the Radeon 780M (gfx1103), where
+        // they were measured; STRATA_INK_DECODE_780M=1 / =0 turns them on / off on any HIP card.
+        bool dec780 = (std::strncmp(mem_info_.arch_name, "gfx1103", 7) == 0);
+        if (const char* ev = std::getenv("STRATA_INK_DECODE_780M"); ev && *ev) dec780 = (ev[0] != '0');
+        moe_fixed_shape_ = dec780 && c_.hidden == 2304 && c_.inter == 1152;
+        unembed_one_row_lds_ = dec780;
+        attn_gqa3_ = dec780 && c_.n_kv > 0 && c_.n_head == 3 * c_.n_kv && c_.head_dim == 128;
         if (blaslt_.ready() && blaslt_moe_min_b_ < 999999) {
             const size_t w13_b = static_cast<size_t>(2 * c_.inter) * c_.hidden * sizeof(half_t);
             const size_t w2_b  = static_cast<size_t>(c_.hidden) * c_.inter * sizeof(half_t);
@@ -892,6 +901,31 @@ public:
 
         // 2. Load embedded DSpark tensors to GPU if present & enabled
         has_dspark_ = opts.enable_dspark && dspark_cfg_.present;
+        // Opt-in 8-bit trunk for the one-token step (changes the output): Q8 copies of each layer's [q; r; gate; k; v] and
+        // wo matrices, made on the GPU from the BF16 ones, which stay for the prompt and for several tokens. Off with DSpark
+        // (a verify window must give the one-token step's values, #6671).
+        if (const char* ev = std::getenv("STRATA_INK_TRUNK_I8"); ev && ev[0] == '1' && !has_dspark_ && (c_.hidden % 32) == 0) {
+            auto make_q8 = [&](const GpuBuffer& bf, size_t rows, size_t K, GpuBuffer& out) -> bool {
+                const size_t n = rows * K, nb = n / 32;
+                if (alloc_gpu_buffer(out, n + nb * sizeof(half_t), mem_info_.is_uma) != hipSuccess) return false;
+                k_quant_bf16_q8_32<<<static_cast<unsigned>((nb + 7) / 8), 256, 0, stream_>>>(
+                    reinterpret_cast<const uint16_t*>(bf.dev_ptr), reinterpret_cast<int8_t*>(out.dev_ptr),
+                    reinterpret_cast<half_t*>(out.dev_ptr + n), nb);
+                return true;
+            };
+            const int q_dim_l = c_.n_head * c_.head_dim;
+            trunk_qkvrg_q8_.resize(c_.n_phys);
+            trunk_wo_q8_.resize(c_.n_phys);
+            bool ok = (q_dim_l % 32) == 0;
+            for (int il = 0; ok && il < c_.n_phys; ++il) {
+                if (trunk_qkvrg_[il].dev_ptr)
+                    ok = make_q8(trunk_qkvrg_[il], trunk_qkvrg_[il].bytes / (2u * c_.hidden), c_.hidden, trunk_qkvrg_q8_[il]);
+                const auto it = trunk_bf16_.find("model.llm.layers." + std::to_string(il) + ".attn.wo_ud.weight");
+                if (ok && it != trunk_bf16_.end()) ok = make_q8(it->second, c_.hidden, q_dim_l, trunk_wo_q8_[il]);
+            }
+            trunk_i8_ = ok && hip_ok(hipStreamSynchronize(stream_), "q8 trunk", err);
+            std::fprintf(stderr, "[ink-hip] 8-bit trunk for the one-token step: %s\n", trunk_i8_ ? "on (STRATA_INK_TRUNK_I8=1)" : "failed, BF16");
+        }
         if (has_dspark_) {
             for (const auto& kv : model.m.dspark_tensors) {
                 std::string k = kv.first;
@@ -2038,7 +2072,7 @@ public:
         constexpr int kCandArgBlks = (kNumCand + 7) / 8;
 
         // Read unembed[V, D] ONCE across all n_draft steps (2 WG/CU union LDS!)
-        k5_dspark_base_top2_screen<<<kScreenBlks, 256, 0, stream_>>>(
+        k5_dspark_base_top2_screen<><<<kScreenBlks, 256, 0, stream_>>>(
             unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
             cur + D,
             reinterpret_cast<float*>(d_dspark_cand_v_.dev_ptr),
@@ -2283,7 +2317,9 @@ public:
                 constexpr int kScreenBlks = 256;
                 constexpr int kNumCand = kScreenBlks * 2;  // 512
 
-                k5_dspark_base_top2_screen<<<kScreenBlks, 256, 0, stream_>>>(
+                ((unembed_one_row_lds_ && unemb_pk.info.fmt == CODE_S6_K && D == 2304)
+                     ? k5_dspark_base_top2_screen<CODE_S6_K, 2304, kBeamMaxSteps> : k5_dspark_base_top2_screen<>)
+                    <<<kScreenBlks, 256, 0, stream_>>>(
                     unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
                     cur + D,
                     reinterpret_cast<float*>(d_dspark_cand_v_.dev_ptr),
@@ -3904,6 +3940,16 @@ private:
                     const int tot_n = 2 * q_dim + r_dim + 2 * kv_dim;
                     if (B == 1 && D <= 4096 && (D & 7) == 0) {
                         const int ns = sink_is_f32 ? c_.n_head : 0;
+                        if (trunk_i8_ && trunk_qkvrg_q8_[ip].dev_ptr) {
+                            const auto& q8 = trunk_qkvrg_q8_[ip];
+                            const size_t nq = trunk_qkvrg_[ip].bytes / 2u;
+                            k_q8_gemv1_qkvrg<<<(tot_n + ns + 7) / 8, 256, 0, stream_>>>(
+                                reinterpret_cast<const int8_t*>(q8.dev_ptr), reinterpret_cast<const half_t*>(q8.dev_ptr + nq),
+                                q_in, q, r_raw, gatea, k_raw, v_raw,
+                                sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
+                                sink_is_f32 ? sinks : nullptr,
+                                q_dim, r_dim, kv_dim, tot_n, ns, D);
+                        } else
                         k_bf16_gemv1_qkvrg<<<(tot_n + ns + 7) / 8, 256, 0, stream_>>>(
                             w_cat, q_in, q, r_raw, gatea, k_raw, v_raw,
                             sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
@@ -3919,6 +3965,16 @@ private:
                     const int qrg_n = 2 * q_dim + r_dim;
                     if (B == 1 && D <= 4096 && (D & 7) == 0) {
                         const int ns = sink_is_f32 ? c_.n_head : 0;
+                        if (trunk_i8_ && trunk_qkvrg_q8_[ip].dev_ptr) {
+                            const auto& q8 = trunk_qkvrg_q8_[ip];
+                            const size_t nq = trunk_qkvrg_[ip].bytes / 2u;
+                            k_q8_gemv1_qkvrg<<<(qrg_n + ns + 7) / 8, 256, 0, stream_>>>(
+                                reinterpret_cast<const int8_t*>(q8.dev_ptr), reinterpret_cast<const half_t*>(q8.dev_ptr + nq),
+                                q_in, q, r_raw, gatea, nullptr, nullptr,
+                                sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
+                                sink_is_f32 ? sinks : nullptr,
+                                q_dim, r_dim, kv_dim, qrg_n, ns, D);
+                        } else
                         k_bf16_gemv1_qkvrg<<<(qrg_n + ns + 7) / 8, 256, 0, stream_>>>(
                             w_cat, q_in, q, r_raw, gatea, nullptr, nullptr,
                             sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
@@ -3930,8 +3986,17 @@ private:
                         k_split_qkvrg<<<dim3(((qrg_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
                             cat_out, q, r_raw, gatea, nullptr, nullptr, B, q_dim, r_dim, kv_dim, qrg_n);
                     }
+                    if (B == 1 && trunk_i8_ && trunk_qkvrg_q8_[ip].dev_ptr) {
+                        const auto& q8 = trunk_qkvrg_q8_[ip];
+                        const size_t nq = trunk_qkvrg_[ip].bytes / 2u;
+                        const int8_t* wq = reinterpret_cast<const int8_t*>(q8.dev_ptr);
+                        const half_t* wd = reinterpret_cast<const half_t*>(q8.dev_ptr + nq);
+                        k_q8_gemv1<<<(kv_dim + 7) / 8, 256, 0, stream_>>>(wq, wd, qrg_n, k_in, k_raw, kv_dim, D);
+                        k_q8_gemv1<<<(kv_dim + 7) / 8, 256, 0, stream_>>>(wq, wd, qrg_n + kv_dim, v_in, v_raw, kv_dim, D);
+                    } else {
                     launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n) * D, k_in, nullptr, k_raw, B, kv_dim, D);
                     launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n + kv_dim) * D, v_in, nullptr, v_raw, B, kv_dim, D);
+                    }
                 }
             } else {
                 launch_trunk_linear(p + ".attn.wq_du.weight", q_in, q,     B, q_dim, D);
@@ -4043,7 +4108,17 @@ private:
             } else if (B <= 4 || exact_rows_) {   // #6671: the one-token kernel for every verify row
                 // 2-Stage FlashDecoding Split-KV (96 blocks x 8 waves = 768 waves at B=1 -> saturates ALL CUs!)
                 float* sp_part = reinterpret_cast<float*>(sc_splitkv_part_.dev_ptr);
-                if (is_fp8) {
+                if (attn_gqa3_) {
+                    // the 3 query heads of each KV head in one block (same partials, same arithmetic)
+                    const float* ksc = is_fp8 ? reinterpret_cast<const float*>(kvp.k_scales.dev_ptr) : nullptr;
+                    const float* vsc = is_fp8 ? reinterpret_cast<const float*>(kvp.v_scales.dev_ptr) : nullptr;
+                    (is_fp8 ? k3_flash_splitkv_part_gqa<true, 4, 3> : k3_flash_splitkv_part_gqa<false, 4, 3>)
+                        <<<dim3(c_.n_kv, B, 4), 256, 0, stream_>>>(
+                        q, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, ksc, vsc,
+                        sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
+                } else if (is_fp8) {
                     k3_flash_splitkv_part<true, 4><<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
                         q, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
                         reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
@@ -4101,6 +4176,16 @@ private:
                     blk_ptrs.push_back(bsave);
                     ++n_blocks;
                 }
+                if (trunk_i8_ && trunk_wo_q8_[ip].dev_ptr) {
+                    const auto& q8 = trunk_wo_q8_[ip];
+                    const size_t nq = static_cast<size_t>(D) * q_dim;
+                    k_q8_gemv1_wo_sconv<<<(D + 7) / 8, 256, 0, stream_>>>(
+                        reinterpret_cast<const int8_t*>(q8.dev_ptr), reinterpret_cast<const half_t*>(q8.dev_ptr + nq), aout,
+                        reinterpret_cast<const float*>(static_sconv_.at(p + ".attn_sconv").dev_ptr),
+                        reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr),
+                        reinterpret_cast<uint16_t*>(d_sconv_attn_all_.dev_ptr + visit * vstride),
+                        cur, bsave, D, q_dim);
+                } else
                 k_bf16_gemv1_wo_sconv<<<(D + 7) / 8, 256, 0, stream_>>>(
                     bf16_ptr(wo_key), aout,
                     reinterpret_cast<const float*>(static_sconv_.at(p + ".attn_sconv").dev_ptr),
@@ -4235,14 +4320,25 @@ private:
                 }
                 const GpuExpertDesc* d_exps = reinterpret_cast<const GpuExpertDesc*>(d_layer_exps_[ip].dev_ptr);
                 pmark(6);
-                k_moe_direct_w13_situ<<<dim3((c_.inter + 3) / 4, B * c_.top_k), 256, 0, stream_>>>(
-                    d_exps, tk_i, mlpf16, reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr),
-                    B, c_.top_k, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                if (moe_fixed_shape_) {
+                    k_moe_direct_w13_situ_fx<4, 16><<<dim3(1152 / 16, B * c_.top_k), 256, 0, stream_>>>(
+                        d_exps, tk_i, mlpf16, reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr), B, c_.top_k, c_.situ_beta, c_.situ_lb);
+                } else {
+                    k_moe_direct_w13_situ<<<dim3((c_.inter + 3) / 4, B * c_.top_k), 256, 0, stream_>>>(
+                        d_exps, tk_i, mlpf16, reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr),
+                        B, c_.top_k, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                }
                 pmark(7);
                 float* y_part = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
-                k_moe_direct_w2_par<<<dim3((D + 7) / 8, B * c_.top_k), 256, 0, stream_>>>(
-                    d_exps, tk_i, reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr),
-                    y_part, B, c_.top_k, D, c_.inter);
+                if (moe_fixed_shape_) {
+                    const half_t* act = reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr);
+                    k_moe_direct_w2_par<2304, 1152, 4><<<dim3(2304 / 32, B * c_.top_k), 256, 0, stream_>>>(
+                        d_exps, tk_i, act, y_part, B, c_.top_k, D, c_.inter);
+                } else {
+                    k_moe_direct_w2_par<<<dim3((D + 7) / 8, B * c_.top_k), 256, 0, stream_>>>(
+                        d_exps, tk_i, reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr),
+                        y_part, B, c_.top_k, D, c_.inter);
+                }
                 if (visit == 0) dbg_hash(202, y_part, B, c_.top_k * D);
                 if (all_distinct_slots && rec_slot < 0) {
                     const size_t vstride = static_cast<size_t>(max_slots_) * 3u * static_cast<size_t>(D) * sizeof(uint16_t);
@@ -4845,6 +4941,7 @@ private:
             }
             const int V = c_.vocab_unpadded;
             const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
+            if (!(B == 1 && launch_unembed_one(unemb_pk, h_norm, V, D)))
             k_unembed_softcap<<<dim3((V + 7) / 8, (B + 15) / 16), 256, 0, stream_>>>(
                 unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
                 h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
@@ -4915,6 +5012,7 @@ private:
                 (void)hipMemcpyAsync(sc_want_idx_.dev_ptr, want_idx.data(), n_want * 4, hipMemcpyHostToDevice, stream_);
                 const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
                 if (prof_on) (void)hipEventRecord(pev[9], stream_);
+                if (!(n_want == 1 && launch_unembed_one(unemb_pk, h_norm, V, D)))
                 k_unembed_softcap<<<dim3((V + 7) / 8, (n_want + 15) / 16), 256, 0, stream_>>>(
                     unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
                     h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
@@ -5395,7 +5493,8 @@ private:
             if (exact_rows_ && !is_fp8) {
                 // #6671: the arithmetic of the one-token step (split-KV, four chunks), so tree row m = step at that position
                 float* sp_part = reinterpret_cast<float*>(sc_splitkv_part_.dev_ptr);
-                k3_flash_tree_splitkv_part<<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
+                (attn_gqa3_ ? k3_flash_tree_splitkv_part_gqa<3> : k3_flash_tree_splitkv_part)
+                    <<<dim3(attn_gqa3_ ? c_.n_kv : c_.n_head, B, 4), 256, 0, stream_>>>(
                     q, rbias, sinks, d_tm, pos_dev,
                     reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
                     kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, tk_v, tv_v,
@@ -5470,14 +5569,27 @@ private:
             if (use_direct_moe) {
                 if (!fused_router_f16) k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
                 pm(6);
+                float* y_part = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
+                const int n_pairs = B * c_.top_k;
+                if (moe_fixed_shape_ && n_pairs <= 256) {
+                    // the one-token kernels of the step, with the (row, expert) pairs in expert order so that the rows sharing
+                    // an expert read its weights from L2 (same arithmetic per pair)
+                    int32_t* perm = reinterpret_cast<int32_t*>(sc_slotk_bidx_.dev_ptr);
+                    k_moe_pairs_by_expert<<<1, 256, 0, stream_>>>(tk_i, perm, n_pairs);
+                    k_moe_direct_w13_situ_fx<4, 16, true><<<dim3(n_pairs, 1152 / 16), 256, 0, stream_>>>(
+                        d_exps, tk_i, mlpf16, reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr), B, c_.top_k, c_.situ_beta, c_.situ_lb, perm);
+                    pm(7);
+                    k_moe_direct_w2_par<2304, 1152, 4, true><<<dim3(n_pairs, 2304 / 32), 256, 0, stream_>>>(
+                        d_exps, tk_i, reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr), y_part, B, c_.top_k, D, c_.inter, perm);
+                } else {
                 k_moe_direct_w13_situ<<<dim3((c_.inter + 3) / 4, B * c_.top_k), 256, 0, stream_>>>(
                     d_exps, tk_i, mlpf16, reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr),
                     B, c_.top_k, D, c_.inter, c_.situ_beta, c_.situ_lb);
                 pm(7);
-                float* y_part = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
                 k_moe_direct_w2_par<<<dim3((D + 7) / 8, B * c_.top_k), 256, 0, stream_>>>(
                     d_exps, tk_i, reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr),
                     y_part, B, c_.top_k, D, c_.inter);
+                }
                 if (visit == 0) dbg_hash(202, y_part, B, c_.top_k * D);
                 k_moe_direct_reduce<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
                     y_part, tk_w, moeout, B, c_.top_k, D);
@@ -5566,34 +5678,19 @@ private:
         half_t* h_f16 = reinterpret_cast<half_t*>(d_tree_h_f16_.dev_ptr);
         pm(9);
         k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(h_norm, h_f16, B * D);
-        if (B <= 4) {
-            k_unembed_argmax_batch_stage1<4><<<kArgBlks, 256, 0, stream_>>>(
-                unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
-                h_norm, h_f16,
-                reinterpret_cast<float*>(d_tree_arg_v_.dev_ptr),
-                reinterpret_cast<int32_t*>(d_tree_arg_i_.dev_ptr),
-                B, V, D);
-        } else if (B <= 6) {
-            k_unembed_argmax_batch_stage1<6><<<kArgBlks, 256, 0, stream_>>>(
-                unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
-                h_norm, h_f16,
-                reinterpret_cast<float*>(d_tree_arg_v_.dev_ptr),
-                reinterpret_cast<int32_t*>(d_tree_arg_i_.dev_ptr),
-                B, V, D);
-        } else if (B <= 8) {
-            k_unembed_argmax_batch_stage1<8><<<kArgBlks, 256, 0, stream_>>>(
-                unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
-                h_norm, h_f16,
-                reinterpret_cast<float*>(d_tree_arg_v_.dev_ptr),
-                reinterpret_cast<int32_t*>(d_tree_arg_i_.dev_ptr),
-                B, V, D);
-        } else {
-            k_unembed_argmax_batch_stage1<12><<<kArgBlks, 256, 0, stream_>>>(
-                unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
-                h_norm, h_f16,
-                reinterpret_cast<float*>(d_tree_arg_v_.dev_ptr),
-                reinterpret_cast<int32_t*>(d_tree_arg_i_.dev_ptr),
-                B, V, D);
+        const bool arg_fixed = unembed_one_row_lds_ && unemb_pk.info.fmt == CODE_S6_K && D == 2304;
+        {
+            const uint8_t* uw = unemb_pk.buf.dev_ptr;
+            const int uf = unemb_pk.info.fmt, ur = static_cast<int>(unemb_pk.info.rows());
+            float* av = reinterpret_cast<float*>(d_tree_arg_v_.dev_ptr);
+            int32_t* ai = reinterpret_cast<int32_t*>(d_tree_arg_i_.dev_ptr);
+#define INK_ARG1(MT) do { if (arg_fixed) k_unembed_argmax_batch_stage1<MT, CODE_S6_K, 2304><<<kArgBlks, 256, 0, stream_>>>(uw, uf, ur, h_norm, h_f16, av, ai, B, V, D); \
+                          else k_unembed_argmax_batch_stage1<MT><<<kArgBlks, 256, 0, stream_>>>(uw, uf, ur, h_norm, h_f16, av, ai, B, V, D); } while (0)
+            if (B <= 4) INK_ARG1(4);
+            else if (B <= 6) INK_ARG1(6);
+            else if (B <= 8) INK_ARG1(8);
+            else INK_ARG1(12);
+#undef INK_ARG1
         }
         k_unembed_argmax_batch_stage2<<<B, 256, 0, stream_>>>(
             reinterpret_cast<const float*>(d_tree_arg_v_.dev_ptr),
@@ -5727,6 +5824,9 @@ private:
         free_gpu_buffer(d_sconv_attn_all_); free_gpu_buffer(d_sconv_mlp_all_);
         for (auto& b : trunk_qkvrg_) free_gpu_buffer(b);
         trunk_qkvrg_.clear();
+        for (auto& b : trunk_qkvrg_q8_) free_gpu_buffer(b);
+        for (auto& b : trunk_wo_q8_) free_gpu_buffer(b);
+        trunk_qkvrg_q8_.clear(); trunk_wo_q8_.clear(); trunk_i8_ = false;
         for (auto& kv : trunk_bf16_) free_gpu_buffer(kv.second);
         for (auto& kv : trunk_f32_) free_gpu_buffer(kv.second);
         for (auto& kv : packed_trunk_) free_gpu_buffer(kv.second.buf);
@@ -5859,6 +5959,26 @@ private:
     };
     int blaslt_moe_min_b_ = 999999;
     bool use_i8_moe_wmma_ = true;
+    bool moe_fixed_shape_ = false;
+    bool unembed_one_row_lds_ = false;
+    bool attn_gqa3_ = false;
+    bool trunk_i8_ = false;
+    std::vector<GpuBuffer> trunk_qkvrg_q8_, trunk_wo_q8_;
+
+    // One-token unembed on k_unembed_softcap_one_sk (want index from sc_want_idx_, logits to sc_logits_). False: not
+    // taken (switched off, or a table that is not S_K / too wide), the caller launches k_unembed_softcap instead.
+    bool launch_unembed_one(const GpuPackedTensor& pk, const float* h_norm, int V, int D) {
+        const int fmt = pk.info.fmt;
+        if (!unembed_one_row_lds_ || fmt < CODE_S2_K || fmt > CODE_S8_K || sk_sb_bytes(fmt) <= 0 || (D & 255) != 0 || D > 16 * 256) return false;
+        const dim3 grid((V + 31) / 32);   // 8 waves x 4 vocab rows
+        const auto* w = pk.buf.dev_ptr;
+        const auto* wi = reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr);
+        float* out = reinterpret_cast<float*>(sc_logits_.dev_ptr);
+        const float cap = c_.logit_softcap;
+        if (fmt == CODE_S6_K) k_unembed_softcap_one_sk<CODE_S6_K, 4><<<grid, 256, 0, stream_>>>(w, fmt, h_norm, wi, out, V, D, cap);
+        else k_unembed_softcap_one_sk<0, 4><<<grid, 256, 0, stream_>>>(w, fmt, h_norm, wi, out, V, D, cap);
+        return true;
+    }
     KvDtype default_kv_dtype_ = KvDtype::FP16;
     bool has_dspark_ = false;
     int max_slots_ = 1;

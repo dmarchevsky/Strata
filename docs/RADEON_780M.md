@@ -141,6 +141,68 @@ Decode holds ~16 tok/s to 32K, then 12.1 at 64K and 9.8-9.9 at 96-128K (draft ac
 context cost, not the drafter). Memory stays flat: 38.1 of 50 GiB GTT at 131K. Raw:
 [docs/bench-results/2026-10-12-community-gfx1103](bench-results/2026-10-12-community-gfx1103/README.md).
 
+## 7a. Inkling-2-Mini on the 780M
+
+`strata-inkling` is a separate engine: none of the switches in sections 4 and 5, and not the hipBLASLt table, apply to it.
+It keeps hipBLASLt off on RDNA3 (`STRATA_HIPBLASLT=1` read prompts 26% slower here: 252 -> 186 tok/s at 4K, 2 of 2 runs).
+
+On gfx1103 it uses one-token decode kernels by itself (`STRATA_INK_DECODE_780M`; `=0` turns them off, `=1` turns them on
+for another HIP card, not measured there):
+
+- decode attention runs the 3 query heads of each KV head in one block, so each key and value is read once, not 3 times;
+- the expert gate/up kernel picks its codec once per block, at compile time, and does 4 rows per wave;
+- the expert down kernel has its sizes at compile time and does 4 rows per wave;
+- the unembed reads the hidden row into LDS once.
+
+The arithmetic is the same: the greedy token ids were identical (SQ-15: 2 prompts x 256 tokens and a 12K-token prompt
+x 128; SQ-10: 1 x 256).
+
+`STRATA_INK_TRUNK_I8=1` (opt-in, off by default, and off with DSpark drafting) makes the one-token step read 8-bit copies
+of the attention projection and output weights (int8 with one fp16 scale per 32 values, made at load: about 0.65 GB more
+memory). The prompt and the several-token steps keep BF16. This changes the output. Measured against the one-token BF16
+engine on 4 real texts (this repository's docs and code), 1,500 tokens each, fed one token at a time:
+
+| compared with the BF16 one-token step | mean KL | top-1 agreement | perplexity |
+| --- | ---: | ---: | ---: |
+| `STRATA_INK_TRUNK_I8=1` | 0.0039 | 97.8% | -0.3% to +0.3% |
+| the prompt (batched) path, for scale | 0.0031 | 98.3% | -0.05% to +0.8% |
+| the SQ-10 build, for scale | 0.061 | 91.5% | +0.2% to +3.6% |
+
+Measured on a Ryzen 7 255, Radeon 780M, 60 GB DDR5, Fedora kernel 7.3.4, `cwsr_enable=0`, ROCm 10.1 image,
+`strata-inkling --bench`, `--draft off`, one slot, SQ-15, 128 tokens out, 3 interleaved rounds (all 3 the same to 0.1 tok/s):
+
+| prompt | engine 0.1.67 | decode kernels | + `STRATA_INK_TRUNK_I8=1` |
+| ---: | ---: | ---: | ---: |
+| 2K | 10.8 tok/s | 13.0 tok/s | 15.6 tok/s |
+| 32K | 7.3 tok/s | 10.6 tok/s | 12.3 tok/s |
+
+SQ-10 at 2K before the attention and gate/up changes: 10.8 -> 12.3 tok/s (1 pair). Prompt speed did not change (about
+259 tok/s at 2K). `--max-context` did not change decode speed (32K, 128K and 256K). With `STRATA_HIP_PROF=2` the SQ-15
+step at 2K went from 92 ms to 77 ms (63.7 ms with the 8-bit trunk); at 32K the attention went from 50.2 to 18.3 ms.
+Tried and slower here: loading the next key ahead in the attention, more rows per wave in the output projection, and
+an occupancy cap on the expert down kernel.
+
+**DSpark drafting** (`--drafting dspark`) was 7-18% slower here: checking a draft tree cost 4-5x a plain step (6 nodes:
+321 ms against 77). On gfx1103 the check now uses the same switch's kernels: tree attention with the 3 query heads of a KV
+head in one block, the experts in expert order (the rows that share an expert read it from L2), the verify unembed and the
+drafter's vocabulary screen with their sizes at compile time. A 3-node check went from 183 to 123 ms and a 6-node one from
+321 to 197 ms; the screen from 9.5 to 6.3 ms. After a probe that does not pay, the server now waits 40, 80, 160 and then
+320 plain steps before the next one (it was always 40). The text is the same as without drafting (each row is the
+one-token step's value, #6671): the three replies below were identical with drafting on and off.
+
+Server, SQ-15, greedy, `reasoning_effort` none, one request each (tok/s):
+
+| request | drafting off | dspark before | dspark now |
+| --- | ---: | ---: | ---: |
+| code (an LRU cache class with tests, 600 tokens) | 13.6 | 12.0 | 16.2 |
+| list to JSON (600 tokens) | 13.2 | 14.4 | 21.6 |
+| short story (301 tokens) | 13.6 | 11.2 | 12.8 |
+
+What still costs the most in a check is the experts: rows that pick different experts have to read them. The drafter's
+own 8-row matrix products (about 9 ms per draft) did not get faster with fewer barriers. The server's greedy output of a
+long reply (900+ tokens) can differ from run to run with drafting off too (seen with the engine before these changes;
+the command-line generation repeats exactly): not caused by drafting, not yet explained.
+
 ## 8. Not tested
 
 - The TheRock-wheel install for gfx1103 (the hand build above is what was measured).
