@@ -1,0 +1,14 @@
+# The image needs engine/ (to compile), terminal/ (the server) and tools/docker/gfx1103/start.py. Nothing generated.
+*
+!engine/
+!terminal/
+!tools/docker/gfx1103/start.py
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+terminal/engine/
+terminal/engine-*/
+terminal/tests/
+engine/third_party/llama.cpp/
+engine/third_party/*.zip
+**/*.log

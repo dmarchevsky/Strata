@@ -1,0 +1,48 @@
+# Strata, Inkling-2-Mini on the Radeon 780M (gfx1103). For Dockhand or `docker compose up -d`.
+#
+# The image is built once on the host (Dockhand cannot build from a host folder), from the repository root:
+#   docker build -t strata-780m:0.1.67 -f tools/docker/gfx1103/Dockerfile .
+# Every setting below comes from the stack's environment (Dockhand's env editor, or a .env file beside this one):
+# see .env.example. Only MODEL has to be right; the rest have working defaults.
+name: strata-780m
+
+services:
+  strata:
+    image: ${STRATA_IMAGE:-strata-780m:0.1.67}
+    container_name: ${CONTAINER_NAME:-strata-780m-server}
+    restart: unless-stopped
+    ports:
+      - "${BIND:-127.0.0.1}:${PORT:-8090}:8080"          # host address and port; BIND=0.0.0.0 for other devices (set API_KEY then)
+    environment:
+      MODEL: ${MODEL:-/models/Strata/models/inkling-2-mini/Inkling-2-Mini-SQ-15.strata}
+      VISION: ${VISION:-auto}                              # auto | off | /models/.../Inkling-2-Mini-Vision.strata
+      CONTEXT: ${CONTEXT:-128k}                            # 32k | 64k | 128k | 256k | tokens
+      PARALLEL: ${PARALLEL:-1}                             # conversations at the same time (each one needs its own context memory)
+      DRAFTING: ${DRAFTING:-off}                           # off | dspark (SQ-15 on the 780M: code +19%, list/JSON edits +64%, prose -6%; same text)
+      GPU: ${GPU:-0}                                       # HIP device number
+      MODEL_NAME: ${MODEL_NAME:-}                          # empty: from the file name
+      API_KEY: ${API_KEY:-}                                # empty: no key
+      HIPBLASLT_TABLE: ${HIPBLASLT_TABLE:-on}              # on | off; no effect on Inkling (only the Qwen engine reads the table)
+      TOKENIZER: ${TOKENIZER:-}                            # empty: made in /data/tokenizer
+      TOKENIZER_SOURCE: ${TOKENIZER_SOURCE:-}              # .gguf only: folder with tokenizer.json + chat_template.jinja (default: beside the model or Vision file)
+      ENGINE_ARGS: ${ENGINE_ARGS:-}                        # extra strata-inkling flags
+      SERVER_ARGS: ${SERVER_ARGS:-}                        # extra server flags
+      # Any STRATA_* engine or server switch can be added here and reaches both, e.g.:
+      # STRATA_ENGINE_NICE: "0"                            # engine at normal priority (the default lowers it on a desktop iGPU)
+      # STRATA_INKLING_EFFORT: "none"                      # default thinking level when a request names none
+    volumes:
+      - ${MODELS_DIR:-/opt/llm_models}:/models:ro          # the host folder with your model files
+      - strata-data:/data                                  # config, tokenizer, logs
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${VIDEO_GID:-39}"                                 # getent group video | cut -d: -f3
+      - "${RENDER_GID:-105}"                               # getent group render | cut -d: -f3 (the ROCm image has no render group)
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+    shm_size: 2gb
+    stop_grace_period: 2m
+
+volumes:
+  strata-data:
