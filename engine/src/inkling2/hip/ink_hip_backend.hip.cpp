@@ -4527,7 +4527,11 @@ private:
                                 d_exps, d_off, d_btk, xq, xd, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
                         } else {
                             k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
-                            if (layer_gu_class_[ip] == 0) {
+                            if (attn_gqa3_) {
+                                // gfx1103: every layer on the per-block codec-specialized kernel (same arithmetic)
+                                k_moe_grouped_w13_situ_wmma_128<true><<<g13, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                            } else if (layer_gu_class_[ip] == 0) {
                                 k_moe_grouped_w13_situ_wmma_128_spec<0><<<g13, 256, 0, stream_>>>(
                                     d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
                             } else if (layer_gu_class_[ip] == 1) {
@@ -4553,7 +4557,10 @@ private:
                             k_moe_grouped_w2_wmma_sf4_i8_128<<<g2, 256, 0, stream_>>>(
                                 d_exps, d_off, aq, ad, d_by, D, c_.inter);
                         } else {
-                            if (layer_dn_class_[ip] == 0) {
+                            if (attn_gqa3_) {
+                                k_moe_grouped_w2_wmma_128<true><<<g2, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_act, d_by, D, c_.inter);
+                            } else if (layer_dn_class_[ip] == 0) {
                                 k_moe_grouped_w2_wmma_128_spec<0><<<g2, 256, 0, stream_>>>(
                                     d_exps, d_off, d_act, d_by, D, c_.inter);
                             } else if (layer_dn_class_[ip] == 1) {

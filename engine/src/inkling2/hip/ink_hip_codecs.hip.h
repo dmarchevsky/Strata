@@ -6761,7 +6761,39 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_sf4_i8_128(
 #endif
 }
 
+// 8 unscaled S_K weights from raw words already in registers: the formulas of decode_sk_8_unscaled_f16 (same FP16 values).
+// S2_K: lo = the u16 at pl + (j0 >> 2); S3_K: lo = that u16, hi = the byte at pl + 64 + (j0 >> 3); S4_K: lo = the u32 at
+// pl + (j0 >> 1).
+template <int C>
+__device__ __forceinline__ uint4 sk8_from_raw(uint32_t lo, uint32_t hi) {
+    uint32_t w2[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if constexpr (C == CODE_S2_K) {
+            const int a = static_cast<int>(((lo >> (4 * i)) & 3u) << 1) - 3;
+            const int b = static_cast<int>(((lo >> (4 * i + 2)) & 3u) << 1) - 3;
+            const hv2 h = {static_cast<half_t>(a), static_cast<half_t>(b)};
+            w2[i] = __builtin_bit_cast(uint32_t, h);
+        } else if constexpr (C == CODE_S3_K) {
+            const uint32_t q0 = ((lo >> (4 * i)) & 3u) | (((hi >> (2 * i)) & 1u) << 2);
+            const uint32_t q1 = ((lo >> (4 * i + 2)) & 3u) | (((hi >> (2 * i + 1)) & 1u) << 2);
+            const hv2 h = {static_cast<half_t>(static_cast<int>(q0 << 1) - 7),
+                           static_cast<half_t>(static_cast<int>(q1 << 1) - 7)};
+            w2[i] = __builtin_bit_cast(uint32_t, h);
+        } else {
+            const uint32_t by = (lo >> (8 * i)) & 0xFFu;
+            const hv2 h = {static_cast<half_t>(static_cast<int>((by & 15u) << 1) - 15),
+                           static_cast<half_t>(static_cast<int>((by >> 4) << 1) - 15)};
+            w2[i] = __builtin_bit_cast(uint32_t, h);
+        }
+    }
+    return make_uint4(w2[0], w2[1], w2[2], w2[3]);
+}
+
 // BM=128, BN=128, BK=32 FP16 WMMA Grouped-MoE w13 & w2 (21.5 KB LDS -> 2-3 WG/CU; handles MX8 + SF4 + S_K!)
+// kSpec: the tile loop runs with the block's codec as a compile-time constant (one switch per block), and for
+// SF4 / S2_K / S3_K / S4_K pipelined over two LDS stages; the same FP16 weights and the same WMMA order.
+template <bool kSpec = false>
 __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
     const GpuExpertDesc* __restrict__ exps,
     const int32_t* __restrict__ exp_off,
@@ -6779,8 +6811,9 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
     const GpuExpertDesc desc = exps[eid];
     if (!desc.body) return;
 
-    __shared__ alignas(16) half_t sX[BM * LD];   // 10,240 B
-    __shared__ alignas(16) half_t sW[BN * LD];   // 10,240 B
+    // two stages for the pipelined loop (kSpec, SF4 / S2_K / S3_K / S4_K); the other paths use the first
+    __shared__ alignas(16) half_t sX[(kSpec ? 2 : 1) * BM * LD];   // 10,240 B per stage
+    __shared__ alignas(16) half_t sW[(kSpec ? 2 : 1) * BN * LD];   // 10,240 B per stage
     __shared__ half_t s_e4m3[256];               //    512 B
     __shared__ int32_t sTok[BM];                 //    512 B -> 21.5 KB
 
@@ -6813,6 +6846,10 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
     const float out_scale = (desc.gu_code == CODE_SF4) ? (sf4_outer * 16.0f) : 1.0f;
     const int t_stride = gridDim.z * BM;
 
+    // kSpec: the tile loop with the block's codec as a compile-time constant C (one switch per block; same statements)
+    auto run = [&](auto ctag) {
+    constexpr int C = decltype(ctag)::value;
+    const int code = C >= 0 ? C : static_cast<int>(desc.gu_code);
     for (int t0 = blockIdx.z * BM; t0 < m_e; t0 += t_stride) {
         const int tm = (m_e - t0 < BM) ? (m_e - t0) : BM;
         if (tid < BM) sTok[tid] = (tid < tm) ? bucket_tok[beg + t0 + tid] : 0;
@@ -6824,6 +6861,131 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
 #pragma unroll
             for (int ni = 0; ni < 4; ++ni) acc[mi][ni] = fv8_zero();
 
+        if constexpr (C == CODE_SF4 || C == CODE_S2_K || C == CODE_S3_K || C == CODE_S4_K) {
+        // Pipelined: the next step's raw X words and weight bytes are loaded into registers before this step's WMMAs,
+        // and unpacked into the other LDS stage after them (the same unpacking formulas: same FP16 values); one barrier
+        // per step.
+        uint4 xr0 = make_uint4(0, 0, 0, 0), xr1 = make_uint4(0, 0, 0, 0);
+        uint32_t wlo = 0, whi = 0, wsc = 0;
+        const int lr = tid >> 1, lq = tid & 1;
+        const int lgn = n_blk + lr;
+        auto fetch = [&](int kk0) {
+            {
+                const int r = tid >> 2, c8 = tid & 3;
+                xr0 = (r < tm) ? *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(sTok[r]) * D + kk0 + c8 * 8)
+                               : make_uint4(0, 0, 0, 0);
+            }
+            {
+                const int r = (256 + tid) >> 2, c8 = (256 + tid) & 3;
+                xr1 = (r < tm) ? *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(sTok[r]) * D + kk0 + c8 * 8)
+                               : make_uint4(0, 0, 0, 0);
+            }
+            if (lgn < N) {
+                if constexpr (C == CODE_SF4) {
+                    const int gb = (kk0 >> 4) + lq;
+                    wsc = sf4_s[static_cast<size_t>(lgn) * (D >> 4) + gb];
+                    const uint2 raw = *reinterpret_cast<const uint2*>(sf4_p + static_cast<size_t>(lgn) * (D >> 1) + gb * 8);
+                    wlo = raw.x; whi = raw.y;
+                } else {
+                    const int sbi = kk0 >> 8, g = (kk0 >> 6) & 3, half_off = (kk0 & 32);
+                    const uint8_t* blk = sk_w + (static_cast<size_t>(lgn) * nsb + sbi) * sb_b;
+                    const uint8_t* pl = blk + 6;
+                    const int j = (g << 6) + half_off + lq * 16;
+                    wsc = static_cast<uint32_t>(ld_u16_unaligned(blk)) | (static_cast<uint32_t>(blk[2 + g]) << 16);
+                    if constexpr (C == CODE_S2_K) {
+                        wlo = ld_u32_unaligned(pl + (j >> 2));
+                    } else if constexpr (C == CODE_S3_K) {
+                        wlo = ld_u32_unaligned(pl + (j >> 2));
+                        whi = ld_u16_unaligned(pl + 64 + (j >> 3));
+                    } else {
+                        wlo = ld_u32_unaligned(pl + (j >> 1));
+                        whi = ld_u32_unaligned(pl + (j >> 1) + 4);
+                    }
+                }
+            }
+        };
+        auto stage = [&](int st) {
+            half_t* Xs = sX + st * BM * LD;
+            half_t* Ws = sW + st * BN * LD;
+            { const int r = tid >> 2, c8 = tid & 3; *reinterpret_cast<uint4*>(&Xs[r * LD + c8 * 8]) = xr0; }
+            { const int r = (256 + tid) >> 2, c8 = (256 + tid) & 3; *reinterpret_cast<uint4*>(&Xs[r * LD + c8 * 8]) = xr1; }
+            half_t* dst = &Ws[lr * LD + lq * 16];
+            if (lgn < N) {
+                if constexpr (C == CODE_SF4) {
+                    const uint32_t sc2 = h2_splat(e4m3fn_to_f32(static_cast<uint8_t>(wsc)) * 0.0625f);
+                    uint32_t o0[4], o1[4];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const uint32_t b0 = (wlo >> (i * 8)) & 0xFFu;
+                        const uint32_t b1 = (whi >> (i * 8)) & 0xFFu;
+                        const hv2 h0 = {sf4_e2m1_f16(b0 & 15u), sf4_e2m1_f16(b0 >> 4)};
+                        const hv2 h1 = {sf4_e2m1_f16(b1 & 15u), sf4_e2m1_f16(b1 >> 4)};
+                        o0[i] = h2_mul(__builtin_bit_cast(uint32_t, h0), sc2);
+                        o1[i] = h2_mul(__builtin_bit_cast(uint32_t, h1), sc2);
+                    }
+                    *reinterpret_cast<uint4*>(dst)     = make_uint4(o0[0], o0[1], o0[2], o0[3]);
+                    *reinterpret_cast<uint4*>(dst + 8) = make_uint4(o1[0], o1[1], o1[2], o1[3]);
+                } else {
+                    // decode_sk_sub_eff_i8: D * (blk[2 + g] / 255), times 0.5 for S2_K .. S6_K
+                    const uint16_t dbits = static_cast<uint16_t>(wsc & 0xFFFFu);
+                    const float Dsc = static_cast<float>(__builtin_bit_cast(half_t, dbits));
+                    const float eff = 0.5f * (Dsc * (static_cast<float>((wsc >> 16) & 0xFFu) * (1.0f / 255.0f)));
+                    const uint32_t ef2 = h2_splat(eff);
+                    uint4 u0, u1;
+                    if constexpr (C == CODE_S2_K) {
+                        u0 = sk8_from_raw<C>(wlo & 0xFFFFu, 0u); u1 = sk8_from_raw<C>(wlo >> 16, 0u);
+                    } else if constexpr (C == CODE_S3_K) {
+                        u0 = sk8_from_raw<C>(wlo & 0xFFFFu, whi & 0xFFu); u1 = sk8_from_raw<C>(wlo >> 16, (whi >> 8) & 0xFFu);
+                    } else {
+                        u0 = sk8_from_raw<C>(wlo, 0u); u1 = sk8_from_raw<C>(whi, 0u);
+                    }
+                    *reinterpret_cast<uint4*>(dst)     = make_uint4(h2_mul(u0.x, ef2), h2_mul(u0.y, ef2), h2_mul(u0.z, ef2), h2_mul(u0.w, ef2));
+                    *reinterpret_cast<uint4*>(dst + 8) = make_uint4(h2_mul(u1.x, ef2), h2_mul(u1.y, ef2), h2_mul(u1.z, ef2), h2_mul(u1.w, ef2));
+                }
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
+            }
+        };
+        auto compute = [&](int st) {
+            const half_t* Xs = sX + st * BM * LD;
+            const half_t* Ws = sW + st * BN * LD;
+            if (wm * 32 < tm) {
+                const bool do_m1 = (wm * 32 + 16 < tm);
+#pragma unroll
+                for (int kk = 0; kk < 2; ++kk) {
+                    wmma_h_t b0 = wmma_ld_h(&Ws[(wn * 64 +  0 + l16) * LD + kk * 16], hi);
+                    wmma_h_t b1 = wmma_ld_h(&Ws[(wn * 64 + 16 + l16) * LD + kk * 16], hi);
+                    wmma_h_t b2 = wmma_ld_h(&Ws[(wn * 64 + 32 + l16) * LD + kk * 16], hi);
+                    wmma_h_t b3 = wmma_ld_h(&Ws[(wn * 64 + 48 + l16) * LD + kk * 16], hi);
+                    wmma_h_t a0 = wmma_ld_h(&Xs[(wm * 32 + l16) * LD + kk * 16], hi);
+                    acc[0][0] = wmma_f16(a0, b0, acc[0][0]);
+                    acc[0][1] = wmma_f16(a0, b1, acc[0][1]);
+                    acc[0][2] = wmma_f16(a0, b2, acc[0][2]);
+                    acc[0][3] = wmma_f16(a0, b3, acc[0][3]);
+                    if (do_m1) {
+                        wmma_h_t a1 = wmma_ld_h(&Xs[(wm * 32 + 16 + l16) * LD + kk * 16], hi);
+                        acc[1][0] = wmma_f16(a1, b0, acc[1][0]);
+                        acc[1][1] = wmma_f16(a1, b1, acc[1][1]);
+                        acc[1][2] = wmma_f16(a1, b2, acc[1][2]);
+                        acc[1][3] = wmma_f16(a1, b3, acc[1][3]);
+                    }
+                }
+            }
+        };
+        fetch(0);
+        stage(0);
+        sync_lds();
+        int st = 0;
+        for (int k0 = 0; k0 < D; k0 += BK) {
+            const bool nxt = (k0 + BK < D);
+            if (nxt) fetch(k0 + BK);
+            compute(st);
+            if (nxt) stage(st ^ 1);
+            sync_lds();
+            st ^= 1;
+        }
+        } else {
         for (int k0 = 0; k0 < D; k0 += BK) {
 #pragma unroll
             for (int iter = 0; iter < 2; ++iter) {
@@ -6833,7 +6995,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
                 if (r < tm) v = *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(sTok[r]) * D + k0 + c8 * 8);
                 *reinterpret_cast<uint4*>(&sX[r * LD + c8 * 8]) = v;
             }
-            if (desc.gu_code == CODE_SF4) {
+            if (code == CODE_SF4) {
                 const int r = tid >> 1, b2 = tid & 1;
                 const int gn = n_blk + r;
                 const int gb = (k0 >> 4) + b2;
@@ -6857,7 +7019,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
                     *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
                     *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
                 }
-            } else if (desc.gu_code == CODE_MX8) {
+            } else if (code == CODE_MX8) {
                 const int r = tid >> 1, q16 = tid & 1;  // 2 threads per row x 16 weights = 32 weights!
                 const int gn = n_blk + r;
                 const int gb = k0 >> 5;
@@ -6879,7 +7041,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
                     *reinterpret_cast<uint4*>(dst)     = make_uint4(0, 0, 0, 0);
                     *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
                 }
-            } else if (desc.gu_code == CODE_GGUF_RAW) {
+            } else if (code == CODE_GGUF_RAW) {
                 const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
                 const uint32_t gt = hdr->gu_type;
                 const size_t rb = hip_gguf_row_bytes(gt, D);
@@ -6907,9 +7069,9 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
                 half_t* dst = &sW[r * LD + q16 * 16];
                 if (gn < N) {
                     const uint8_t* blk = sk_w + (static_cast<size_t>(gn) * nsb + s) * sb_b;
-                    const uint32_t ef2 = h2_splat(decode_sk_sub_eff_i8(blk, desc.gu_code, g));
+                    const uint32_t ef2 = h2_splat(decode_sk_sub_eff_i8(blk, code, g));
                     uint4 o0, o1;
-                    decode_sk_16_f16(blk + 6, desc.gu_code, (g << 6) + half_off + q16 * 16, ef2, o0, o1);
+                    decode_sk_16_f16(blk + 6, code, (g << 6) + half_off + q16 * 16, ef2, o0, o1);
                     *reinterpret_cast<uint4*>(dst)     = o0;
                     *reinterpret_cast<uint4*>(dst + 8) = o1;
                 } else {
@@ -6944,6 +7106,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
             sync_lds();
         }
 
+        }
         if (wm * 32 < tm) {
             const bool is_even = ((lane & 1) == 0);
 #pragma unroll
@@ -6968,11 +7131,26 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
             }
         }
     }
+    };
+    if constexpr (kSpec) {
+        switch (desc.gu_code) {
+            case CODE_SF4:  run(std::integral_constant<int, CODE_SF4>{}); break;
+            case CODE_S3_K: run(std::integral_constant<int, CODE_S3_K>{}); break;
+            case CODE_S4_K: run(std::integral_constant<int, CODE_S4_K>{}); break;
+            case CODE_S2_K: run(std::integral_constant<int, CODE_S2_K>{}); break;
+            default:        run(std::integral_constant<int, -1>{}); break;
+        }
+    } else {
+        run(std::integral_constant<int, -1>{});
+    }
 #else
     (void)exps; (void)exp_off; (void)bucket_tok; (void)X_f16; (void)bucket_act; (void)D; (void)inter; (void)beta; (void)lb;
 #endif
 }
 
+// kSpec: the tile loop runs with the block's codec as a compile-time constant (one switch per block), and for
+// SF4 / S2_K / S3_K / S4_K pipelined over two LDS stages; the same FP16 weights and the same WMMA order.
+template <bool kSpec = false>
 __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
     const GpuExpertDesc* __restrict__ exps,
     const int32_t* __restrict__ exp_off,
@@ -6989,8 +7167,8 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
     const GpuExpertDesc desc = exps[eid];
     if (!desc.body) return;
 
-    __shared__ alignas(16) half_t sX[BM * LD];
-    __shared__ alignas(16) half_t sW[BN * LD];
+    __shared__ alignas(16) half_t sX[(kSpec ? 2 : 1) * BM * LD];   // two stages for the pipelined loop (kSpec)
+    __shared__ alignas(16) half_t sW[(kSpec ? 2 : 1) * BN * LD];
     __shared__ half_t s_e4m3[256];
 
     const int tid = threadIdx.x;
@@ -7020,6 +7198,10 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
     const float out_scale = (desc.dn_code == CODE_SF4) ? (sf4_outer * 16.0f) : 1.0f;
     const int t_stride = gridDim.z * BM;
 
+    // kSpec: the tile loop with the block's codec as a compile-time constant C (one switch per block; same statements)
+    auto run = [&](auto ctag) {
+    constexpr int C = decltype(ctag)::value;
+    const int code = C >= 0 ? C : static_cast<int>(desc.dn_code);
     for (int t0 = blockIdx.z * BM; t0 < m_e; t0 += t_stride) {
         const int tm = (m_e - t0 < BM) ? (m_e - t0) : BM;
         fv8 acc[2][4];
@@ -7028,6 +7210,131 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
 #pragma unroll
             for (int ni = 0; ni < 4; ++ni) acc[mi][ni] = fv8_zero();
 
+        if constexpr (C == CODE_SF4 || C == CODE_S2_K || C == CODE_S3_K || C == CODE_S4_K) {
+        // Pipelined as in k_moe_grouped_w13_situ_wmma_128 (same unpacking formulas, same FP16 values, one barrier per step)
+        uint4 xr0 = make_uint4(0, 0, 0, 0), xr1 = make_uint4(0, 0, 0, 0);
+        uint32_t wlo = 0, whi = 0, wsc = 0;
+        const int lr = tid >> 1, lq = tid & 1;
+        const int lgn = n_blk + lr;
+        auto fetch = [&](int kk0) {
+            {
+                const int r = tid >> 2, c8 = tid & 3;
+                xr0 = (r < tm) ? *reinterpret_cast<const uint4*>(bucket_act + static_cast<size_t>(beg + t0 + r) * inter + kk0 + c8 * 8)
+                               : make_uint4(0, 0, 0, 0);
+            }
+            {
+                const int r = (256 + tid) >> 2, c8 = (256 + tid) & 3;
+                xr1 = (r < tm) ? *reinterpret_cast<const uint4*>(bucket_act + static_cast<size_t>(beg + t0 + r) * inter + kk0 + c8 * 8)
+                               : make_uint4(0, 0, 0, 0);
+            }
+            if (lgn < D) {
+                if constexpr (C == CODE_SF4) {
+                    const int gb = (kk0 >> 4) + lq;
+                    wsc = sf4_s[static_cast<size_t>(lgn) * (inter >> 4) + gb];
+                    const uint2 raw = *reinterpret_cast<const uint2*>(sf4_p + static_cast<size_t>(lgn) * (inter >> 1) + gb * 8);
+                    wlo = raw.x; whi = raw.y;
+                } else {
+                    const int sg = kk0 >> 6, half_off = (kk0 & 32);
+                    const int pair = lgn >> 1, is_odd = lgn & 1;
+                    const int sub_global = is_odd * sub_per_row + sg;
+                    const int sbi = sub_global >> 2, g = sub_global & 3;
+                    const uint8_t* blk = sk_w + (static_cast<size_t>(pair) * sb_per_pair + sbi) * sb_b;
+                    const uint8_t* pl = blk + 6;
+                    const int j = (g << 6) + half_off + lq * 16;
+                    wsc = static_cast<uint32_t>(ld_u16_unaligned(blk)) | (static_cast<uint32_t>(blk[2 + g]) << 16);
+                    if constexpr (C == CODE_S2_K) {
+                        wlo = ld_u32_unaligned(pl + (j >> 2));
+                    } else if constexpr (C == CODE_S3_K) {
+                        wlo = ld_u32_unaligned(pl + (j >> 2));
+                        whi = ld_u16_unaligned(pl + 64 + (j >> 3));
+                    } else {
+                        wlo = ld_u32_unaligned(pl + (j >> 1));
+                        whi = ld_u32_unaligned(pl + (j >> 1) + 4);
+                    }
+                }
+            }
+        };
+        auto stage = [&](int st) {
+            half_t* Xs = sX + st * BM * LD;
+            half_t* Ws = sW + st * BN * LD;
+            { const int r = tid >> 2, c8 = tid & 3; *reinterpret_cast<uint4*>(&Xs[r * LD + c8 * 8]) = xr0; }
+            { const int r = (256 + tid) >> 2, c8 = (256 + tid) & 3; *reinterpret_cast<uint4*>(&Xs[r * LD + c8 * 8]) = xr1; }
+            half_t* dst = &Ws[lr * LD + lq * 16];
+            if (lgn < D) {
+                if constexpr (C == CODE_SF4) {
+                    const uint32_t sc2 = h2_splat(e4m3fn_to_f32(static_cast<uint8_t>(wsc)) * 0.0625f);
+                    uint32_t o0[4], o1[4];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const uint32_t b0 = (wlo >> (i * 8)) & 0xFFu;
+                        const uint32_t b1 = (whi >> (i * 8)) & 0xFFu;
+                        const hv2 h0 = {sf4_e2m1_f16(b0 & 15u), sf4_e2m1_f16(b0 >> 4)};
+                        const hv2 h1 = {sf4_e2m1_f16(b1 & 15u), sf4_e2m1_f16(b1 >> 4)};
+                        o0[i] = h2_mul(__builtin_bit_cast(uint32_t, h0), sc2);
+                        o1[i] = h2_mul(__builtin_bit_cast(uint32_t, h1), sc2);
+                    }
+                    *reinterpret_cast<uint4*>(dst)     = make_uint4(o0[0], o0[1], o0[2], o0[3]);
+                    *reinterpret_cast<uint4*>(dst + 8) = make_uint4(o1[0], o1[1], o1[2], o1[3]);
+                } else {
+                    const uint16_t dbits = static_cast<uint16_t>(wsc & 0xFFFFu);
+                    const float Dsc = static_cast<float>(__builtin_bit_cast(half_t, dbits));
+                    const float eff = 0.5f * (Dsc * (static_cast<float>((wsc >> 16) & 0xFFu) * (1.0f / 255.0f)));
+                    const uint32_t ef2 = h2_splat(eff);
+                    uint4 u0, u1;
+                    if constexpr (C == CODE_S2_K) {
+                        u0 = sk8_from_raw<C>(wlo & 0xFFFFu, 0u); u1 = sk8_from_raw<C>(wlo >> 16, 0u);
+                    } else if constexpr (C == CODE_S3_K) {
+                        u0 = sk8_from_raw<C>(wlo & 0xFFFFu, whi & 0xFFu); u1 = sk8_from_raw<C>(wlo >> 16, (whi >> 8) & 0xFFu);
+                    } else {
+                        u0 = sk8_from_raw<C>(wlo, 0u); u1 = sk8_from_raw<C>(whi, 0u);
+                    }
+                    *reinterpret_cast<uint4*>(dst)     = make_uint4(h2_mul(u0.x, ef2), h2_mul(u0.y, ef2), h2_mul(u0.z, ef2), h2_mul(u0.w, ef2));
+                    *reinterpret_cast<uint4*>(dst + 8) = make_uint4(h2_mul(u1.x, ef2), h2_mul(u1.y, ef2), h2_mul(u1.z, ef2), h2_mul(u1.w, ef2));
+                }
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
+            }
+        };
+        auto compute = [&](int st) {
+            const half_t* Xs = sX + st * BM * LD;
+            const half_t* Ws = sW + st * BN * LD;
+            if (wm * 32 < tm) {
+                const bool do_m1 = (wm * 32 + 16 < tm);
+#pragma unroll
+                for (int kk = 0; kk < 2; ++kk) {
+                    wmma_h_t b0 = wmma_ld_h(&Ws[(wn * 64 +  0 + l16) * LD + kk * 16], hi);
+                    wmma_h_t b1 = wmma_ld_h(&Ws[(wn * 64 + 16 + l16) * LD + kk * 16], hi);
+                    wmma_h_t b2 = wmma_ld_h(&Ws[(wn * 64 + 32 + l16) * LD + kk * 16], hi);
+                    wmma_h_t b3 = wmma_ld_h(&Ws[(wn * 64 + 48 + l16) * LD + kk * 16], hi);
+                    wmma_h_t a0 = wmma_ld_h(&Xs[(wm * 32 + l16) * LD + kk * 16], hi);
+                    acc[0][0] = wmma_f16(a0, b0, acc[0][0]);
+                    acc[0][1] = wmma_f16(a0, b1, acc[0][1]);
+                    acc[0][2] = wmma_f16(a0, b2, acc[0][2]);
+                    acc[0][3] = wmma_f16(a0, b3, acc[0][3]);
+                    if (do_m1) {
+                        wmma_h_t a1 = wmma_ld_h(&Xs[(wm * 32 + 16 + l16) * LD + kk * 16], hi);
+                        acc[1][0] = wmma_f16(a1, b0, acc[1][0]);
+                        acc[1][1] = wmma_f16(a1, b1, acc[1][1]);
+                        acc[1][2] = wmma_f16(a1, b2, acc[1][2]);
+                        acc[1][3] = wmma_f16(a1, b3, acc[1][3]);
+                    }
+                }
+            }
+        };
+        fetch(0);
+        stage(0);
+        sync_lds();
+        int st = 0;
+        for (int k0 = 0; k0 < inter; k0 += BK) {
+            const bool nxt = (k0 + BK < inter);
+            if (nxt) fetch(k0 + BK);
+            compute(st);
+            if (nxt) stage(st ^ 1);
+            sync_lds();
+            st ^= 1;
+        }
+        } else {
         for (int k0 = 0; k0 < inter; k0 += BK) {
 #pragma unroll
             for (int iter = 0; iter < 2; ++iter) {
@@ -7037,7 +7344,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
                 if (r < tm) v = *reinterpret_cast<const uint4*>(bucket_act + static_cast<size_t>(beg + t0 + r) * inter + k0 + c8 * 8);
                 *reinterpret_cast<uint4*>(&sX[r * LD + c8 * 8]) = v;
             }
-            if (desc.dn_code == CODE_SF4) {
+            if (code == CODE_SF4) {
                 const int r = tid >> 1, b2 = tid & 1;
                 const int gn = n_blk + r;
                 const int gb = (k0 >> 4) + b2;
@@ -7061,7 +7368,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
                     *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
                     *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
                 }
-            } else if (desc.dn_code == CODE_MX8) {
+            } else if (code == CODE_MX8) {
                 const int r = tid >> 1, q16 = tid & 1;
                 const int gn = n_blk + r;
                 const int gb = k0 >> 5;
@@ -7083,7 +7390,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
                     *reinterpret_cast<uint4*>(dst)     = make_uint4(0, 0, 0, 0);
                     *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
                 }
-            } else if (desc.dn_code == CODE_GGUF_RAW) {
+            } else if (code == CODE_GGUF_RAW) {
                 const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
                 const uint32_t dt = hdr->dn_type;
                 const size_t rb = hip_gguf_row_bytes(dt, inter);
@@ -7112,9 +7419,9 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
                     const int s = sub_global >> 2;
                     const int g = sub_global & 3;
                     const uint8_t* blk = sk_w + (static_cast<size_t>(pair) * sb_per_pair + s) * sb_b;
-                    const uint32_t ef2 = h2_splat(decode_sk_sub_eff_i8(blk, desc.dn_code, g));
+                    const uint32_t ef2 = h2_splat(decode_sk_sub_eff_i8(blk, code, g));
                     uint4 o0, o1;
-                    decode_sk_16_f16(blk + 6, desc.dn_code, (g << 6) + half_off + q16 * 16, ef2, o0, o1);
+                    decode_sk_16_f16(blk + 6, code, (g << 6) + half_off + q16 * 16, ef2, o0, o1);
                     *reinterpret_cast<uint4*>(dst)     = o0;
                     *reinterpret_cast<uint4*>(dst + 8) = o1;
                 } else {
@@ -7149,6 +7456,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
             sync_lds();
         }
 
+        }
         if (wm * 32 < tm) {
 #pragma unroll
             for (int mi = 0; mi < 2; ++mi) {
@@ -7166,6 +7474,18 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
                 }
             }
         }
+    }
+    };
+    if constexpr (kSpec) {
+        switch (desc.dn_code) {
+            case CODE_SF4:  run(std::integral_constant<int, CODE_SF4>{}); break;
+            case CODE_S3_K: run(std::integral_constant<int, CODE_S3_K>{}); break;
+            case CODE_S4_K: run(std::integral_constant<int, CODE_S4_K>{}); break;
+            case CODE_S2_K: run(std::integral_constant<int, CODE_S2_K>{}); break;
+            default:        run(std::integral_constant<int, -1>{}); break;
+        }
+    } else {
+        run(std::integral_constant<int, -1>{});
     }
 #else
     (void)exps; (void)exp_off; (void)bucket_act; (void)bucket_y; (void)D; (void)inter;
