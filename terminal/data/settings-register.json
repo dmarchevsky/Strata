@@ -17932,11 +17932,13 @@
    "doc_mentions": [
     "docs/RADEON_780M.md:160",
     "docs/RADEON_780M.md:167",
-    "docs/RADEON_780M.md:174"
+    "docs/RADEON_780M.md:174",
+    "docs/RADEON_780M.md:201",
+    "docs/RADEON_780M.md:206"
    ],
    "status": "opt-in",
    "owner": "backends/hip",
-   "note": "Inkling HIP engine. =1: the one-token step reads Q8 copies (int8 + fp16 scale per 32) of the attention q/r/gate/k/v and wo weights, made at load from the BF16 ones (about 0.65 GB more); the prompt and several-token steps keep BF16. Changes the output. Off with DSpark drafting. See RADEON_780M.md for speed and KL.",
+   "note": "Inkling HIP engine. =1: the one-token step reads Q8 copies (int8 + fp16 scale per 32) of the attention q/r/gate/k/v and wo weights (about 0.65 GB more): a GGUF's own Q8_0 blocks where the file stores them so (and its Q8_0 output.weight for the unembed, not with DSpark), else quantized at load from the BF16 copies. The prompt keeps BF16. With DSpark the verify rows read the same copies with the same per-row arithmetic (needs exact verify rows). Changes the output. See RADEON_780M.md.",
    "retire_after": "",
    "retired_in": ""
   },

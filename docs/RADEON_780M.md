@@ -157,7 +157,7 @@ for another HIP card, not measured there):
 The arithmetic is the same: the greedy token ids were identical (SQ-15: 2 prompts x 256 tokens and a 12K-token prompt
 x 128; SQ-10: 1 x 256).
 
-`STRATA_INK_TRUNK_I8=1` (opt-in, off by default, and off with DSpark drafting) makes the one-token step read 8-bit copies
+`STRATA_INK_TRUNK_I8=1` (opt-in, off by default) makes the one-token step read 8-bit copies
 of the attention projection and output weights (int8 with one fp16 scale per 32 values, made at load: about 0.65 GB more
 memory). The prompt and the several-token steps keep BF16. This changes the output. Measured against the one-token BF16
 engine on 4 real texts (this repository's docs and code), 1,500 tokens each, fed one token at a time:
@@ -197,6 +197,21 @@ Server, SQ-15, greedy, `reasoning_effort` none, one request each (tok/s):
 | code (an LRU cache class with tests, 600 tokens) | 13.6 | 12.0 | 16.2 |
 | list to JSON (600 tokens) | 13.2 | 14.4 | 21.6 |
 | short story (301 tokens) | 13.6 | 11.2 | 12.8 |
+
+**With `STRATA_INK_TRUNK_I8=1`** the checks read the same 8-bit copies with the one-token step's arithmetic per row, so
+drafting now works in the 8-bit mode (it was turned off there) and its text is the 8-bit mode's text without drafting
+(code, story and list replies identical, story repeated 5 times). Server, SQ-15, one request each: code 16.6 (8-bit, no
+drafting) / 15.5 (8-bit + dspark) tok/s, list to JSON 16.0 / 21.3, story 16.6 / 15.2. A 3-node check: 111 ms (BF16: 122).
+
+**Unsloth GGUF builds with `STRATA_INK_TRUNK_I8=1`**: the attention, output projection and unembed matrices that the file
+stores as Q8_0 (49 in UD-Q4_K_XL) are used as stored, the file's own int8 values and scales, instead of being re-quantized
+from the BF16 expansion. UD-Q4_K_XL, 2K prompt, 3 interleaved rounds: 11.1-11.3 tok/s (BF16) -> 14.2-14.3 (13.0-13.1 with
+the re-quantized copies). Against the BF16 path on the 4 texts above: mean KL 0.0031, perplexity -0.4% to +0.3%.
+
+Also measured, no change kept: GPU clocks forced to `high` (prompt +2%, decode unchanged: decode is bound by DDR5-5600);
+FP8 KV at 32K (decode 10.4 -> 10.5 tok/s, prompt 5% slower; k8v8 is not supported on HIP); `--chunk` 1024 / 2048 (the
+prompt is still read in 512-token batches, the SWA ring's span cap). About 62% of prompt time is the grouped expert
+kernels (about 32 tokens per expert per batch).
 
 What still costs the most in a check is the experts: rows that pick different experts have to read them. The drafter's
 own 8-row matrix products (about 9 ms per draft) did not get faster with fewer barriers. The server's greedy output of a

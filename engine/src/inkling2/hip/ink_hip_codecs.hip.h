@@ -1986,6 +1986,101 @@ __global__ void __launch_bounds__(256) k_q8_gemv1(const int8_t* __restrict__ Wq,
     if (lane == 0) Y[row] = sum;
 }
 
+// One-token unembed + softcap from a Q8 table (the opt-in 8-bit trunk; for a GGUF the file's own Q8_0 output.weight):
+// h_norm row into LDS once, R vocab rows per wave. Grid: ((V + 8R - 1) / (8R)), Block: 256.
+template <int R>
+__global__ void __launch_bounds__(256) k_unembed_softcap_one_q8(
+    const int8_t* __restrict__ Wq, const half_t* __restrict__ Wd, const float* __restrict__ h_norm,
+    const int32_t* __restrict__ want_idx, float* __restrict__ logits_out, int V, int D, float softcap) {
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int v0 = (blockIdx.x * 8 + wave) * R;
+    __shared__ alignas(16) float sX[4096];
+    const float* h = h_norm + static_cast<size_t>(want_idx[0]) * D;
+    for (int i = tid; i < (D >> 2); i += 256) reinterpret_cast<float4*>(sX)[i] = reinterpret_cast<const float4*>(h)[i];
+    __syncthreads();
+    const float inv_cap = 1.0f / softcap;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int v = v0 + r;
+        if (v >= V) return;
+        const float z = q8_row_dot(Wq + static_cast<size_t>(v) * D, Wd + static_cast<size_t>(v) * (D >> 5), sX, D, lane);
+        if (lane == 0) logits_out[v] = softcap * tanhf(z * inv_cap);
+    }
+}
+
+// Y[m, n] = W[row_off + n, :] . X[m, :] for M tokens, each row with the one-token kernels' arithmetic (q8_row_dot), so a
+// DSpark verify row is the one-token step's value (#6671). Grid: ((N + 7) / 8, M), Block: 256.
+__global__ void __launch_bounds__(256) k_q8_gemv_rows(const int8_t* __restrict__ Wq, const half_t* __restrict__ Wd,
+                                                      int row_off, const float* __restrict__ X, float* __restrict__ Y,
+                                                      int N, int K) {
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int row = blockIdx.x * 8 + wave;
+    const int m = blockIdx.y;
+    __shared__ alignas(16) float sX[4096];
+    const float* x = X + static_cast<size_t>(m) * K;
+    for (int i = tid; i < (K >> 2); i += 256) reinterpret_cast<float4*>(sX)[i] = reinterpret_cast<const float4*>(x)[i];
+    __syncthreads();
+    if (row >= N) return;
+    const size_t r = static_cast<size_t>(row_off + row);
+    const float sum = q8_row_dot(Wq + r * K, Wd + r * (K >> 5), sX, K, lane);
+    if (lane == 0) Y[static_cast<size_t>(m) * N + row] = sum;
+}
+
+// k_q8_gemv_rows for up to MT tokens per block with the weights loaded once: per token the same operations in the same order
+// as q8_row_dot (acc0 over k, acc1 over k + 256, the tail into acc0, then wave32_sum(acc0 + acc1)); X is read from global.
+// Grid: ((N + 7) / 8, (M + MT - 1) / MT), Block: 256.
+template <int MT>
+__global__ void __launch_bounds__(256) k_q8_gemv_rows_mt(const int8_t* __restrict__ Wq, const half_t* __restrict__ Wd,
+                                                         int row_off, const float* __restrict__ X, float* __restrict__ Y,
+                                                         int M, int N, int K) {
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int row = blockIdx.x * 8 + wave;
+    const int m0 = blockIdx.y * MT;
+    const int mc = min(MT, M - m0);
+    (void)tid;
+    if (row >= N) return;
+    const float* sX = X + static_cast<size_t>(m0) * K;   // the tokens' rows, read through the caches (small, shared by all blocks)
+    const size_t r = static_cast<size_t>(row_off + row);
+    const int8_t* qr = Wq + r * K;
+    const half_t* dr = Wd + r * (K >> 5);
+    float acc0[MT], acc1[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) { acc0[t] = 0.0f; acc1[t] = 0.0f; }
+    int k = lane * 8;
+    for (; k + 256 < K; k += 512) {
+        float wa[8], wb[8];
+        q8_ld8(qr, dr, k, wa);
+        q8_ld8(qr, dr, k + 256, wb);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (t < mc) {
+                const float* xs = sX + t * K;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { acc0[t] = fmaf(wa[i], xs[k + i], acc0[t]); acc1[t] = fmaf(wb[i], xs[k + 256 + i], acc1[t]); }
+            }
+        }
+    }
+    if (k < K) {
+        float wa[8];
+        q8_ld8(qr, dr, k, wa);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (t < mc) {
+                const float* xs = sX + t * K;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc0[t] = fmaf(wa[i], xs[k + i], acc0[t]);
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        if (t < mc) {
+            const float sum = wave32_sum(acc0[t] + acc1[t]);
+            if (lane == 0) Y[static_cast<size_t>(m0 + t) * N + row] = sum;
+        }
+    }
+}
+
 // k_bf16_gemv1_qkvrg with the [q; r; gate; k; v] matrix in Q8 (the F32 sink rows as before). Grid: ((tot_n + n_sink + 7) / 8).
 __global__ void __launch_bounds__(256) k_q8_gemv1_qkvrg(
     const int8_t* __restrict__ Wq, const half_t* __restrict__ Wd, const float* __restrict__ X,

@@ -902,9 +902,11 @@ public:
         // 2. Load embedded DSpark tensors to GPU if present & enabled
         has_dspark_ = opts.enable_dspark && dspark_cfg_.present;
         // Opt-in 8-bit trunk for the one-token step (changes the output): Q8 copies of each layer's [q; r; gate; k; v] and
-        // wo matrices, made on the GPU from the BF16 ones, which stay for the prompt and for several tokens. Off with DSpark
-        // (a verify window must give the one-token step's values, #6671).
-        if (const char* ev = std::getenv("STRATA_INK_TRUNK_I8"); ev && ev[0] == '1' && !has_dspark_ && (c_.hidden % 32) == 0) {
+        // wo matrices, made on the GPU from the BF16 ones, which stay for the prompt and for several tokens. With DSpark the
+        // verify rows read the same copies with the same per-row arithmetic (launch_bf16_opt, #6671); without exact verify
+        // rows (STRATA_INK_EXACT_ROWS=0) DSpark keeps BF16.
+        if (const char* ev = std::getenv("STRATA_INK_TRUNK_I8"); ev && ev[0] == '1' && (!has_dspark_ || exact_verify_enabled_) &&
+            (c_.hidden % 32) == 0) {
             auto make_q8 = [&](const GpuBuffer& bf, size_t rows, size_t K, GpuBuffer& out) -> bool {
                 const size_t n = rows * K, nb = n / 32;
                 if (alloc_gpu_buffer(out, n + nb * sizeof(half_t), mem_info_.is_uma) != hipSuccess) return false;
@@ -913,17 +915,70 @@ public:
                     reinterpret_cast<half_t*>(out.dev_ptr + n), nb);
                 return true;
             };
+            // A GGUF that stores these matrices as Q8_0 gives its own blocks unchanged (same int8 and fp16 scales: the file's
+            // weights, no BF16 rounding in between); anything else is quantized from the BF16 copy.
+            auto file_q8 = [&](const std::vector<std::vector<std::string>>& names, size_t K, size_t max_rows, GpuBuffer& out) -> bool {
+                if (model.kind != ModelSourceKind::Gguf || !model.gguf_adapter || !model.gguf_adapter->model) return false;
+                std::vector<std::pair<const uint8_t*, size_t>> parts;
+                size_t rows = 0;
+                for (const auto& alts : names) {
+                    const strata::TensorInfo* ti = nullptr;
+                    const uint8_t* ptr = nullptr;
+                    for (const auto& nmx : alts) {
+                        ptr = model.gguf_adapter->tensor_ptr(*model.gguf_adapter->model, nmx, ti);
+                        if (ptr) break;
+                    }
+                    if (!ptr || !ti || ti->type != 8 || static_cast<size_t>(ti->shape[0]) != K) return false;
+                    const size_t r = std::min<size_t>(static_cast<size_t>(ti->elements() / K), max_rows - rows);
+                    parts.emplace_back(ptr, r);
+                    rows += r;
+                }
+                const size_t n = rows * K, nb = n / 32;
+                std::vector<uint8_t> host(n + nb * sizeof(half_t));
+                size_t row0 = 0;
+                for (const auto& [ptr, r] : parts) {
+                    for (size_t b = 0; b < r * (K / 32); ++b) {
+                        const uint8_t* src = ptr + b * 34;   // Q8_0 block: fp16 d, then 32 int8
+                        const size_t gb = row0 * (K / 32) + b;
+                        std::memcpy(host.data() + n + gb * 2, src, 2);
+                        std::memcpy(host.data() + gb * 32, src + 2, 32);
+                    }
+                    row0 += r;
+                }
+                return upload_raw(out, host.data(), host.size(), err);
+            };
             const int q_dim_l = c_.n_head * c_.head_dim;
             trunk_qkvrg_q8_.resize(c_.n_phys);
             trunk_wo_q8_.resize(c_.n_phys);
             bool ok = (q_dim_l % 32) == 0;
+            int n_file = 0;
             for (int il = 0; ok && il < c_.n_phys; ++il) {
-                if (trunk_qkvrg_[il].dev_ptr)
-                    ok = make_q8(trunk_qkvrg_[il], trunk_qkvrg_[il].bytes / (2u * c_.hidden), c_.hidden, trunk_qkvrg_q8_[il]);
+                const std::string b = "blk." + std::to_string(il) + ".";
+                if (trunk_qkvrg_[il].dev_ptr) {
+                    const size_t rows = trunk_qkvrg_[il].bytes / (2u * c_.hidden);
+                    if (file_q8({{b + "attn_q.weight"}, {b + "attn_r.weight", b + "attn_rel.weight"}, {b + "attn_gate.weight"},
+                                 {b + "attn_k.weight"}, {b + "attn_v.weight"}}, c_.hidden, rows, trunk_qkvrg_q8_[il])) ++n_file;
+                    else ok = make_q8(trunk_qkvrg_[il], rows, c_.hidden, trunk_qkvrg_q8_[il]);
+                }
                 const auto it = trunk_bf16_.find("model.llm.layers." + std::to_string(il) + ".attn.wo_ud.weight");
-                if (ok && it != trunk_bf16_.end()) ok = make_q8(it->second, c_.hidden, q_dim_l, trunk_wo_q8_[il]);
+                if (ok && it != trunk_bf16_.end()) {
+                    if (file_q8({{b + "attn_output.weight"}}, q_dim_l, c_.hidden, trunk_wo_q8_[il])) ++n_file;
+                    else ok = make_q8(it->second, c_.hidden, q_dim_l, trunk_wo_q8_[il]);
+                }
             }
+            // (not with DSpark: the verify argmax reads the packed table, so the one-token step must too)
+            if (ok && !has_dspark_ && file_q8({{"output.weight"}}, c_.hidden, c_.vocab_unpadded, unembed_q8_)) ++n_file;
+            if (n_file > 0) std::fprintf(stderr, "[ink-hip] 8-bit trunk: %d matrices are the GGUF's own Q8_0 blocks\n", n_file);
             trunk_i8_ = ok && hip_ok(hipStreamSynchronize(stream_), "q8 trunk", err);
+            if (trunk_i8_) {
+                for (int il = 0; il < c_.n_phys; ++il) {
+                    if (trunk_qkvrg_[il].dev_ptr && trunk_qkvrg_q8_[il].dev_ptr)
+                        q8_map_.push_back({trunk_qkvrg_[il].dev_ptr, trunk_qkvrg_[il].bytes, c_.hidden, &trunk_qkvrg_q8_[il]});
+                    const auto it = trunk_bf16_.find("model.llm.layers." + std::to_string(il) + ".attn.wo_ud.weight");
+                    if (it != trunk_bf16_.end() && trunk_wo_q8_[il].dev_ptr)
+                        q8_map_.push_back({it->second.dev_ptr, it->second.bytes, q_dim_l, &trunk_wo_q8_[il]});
+                }
+            }
             std::fprintf(stderr, "[ink-hip] 8-bit trunk for the one-token step: %s\n", trunk_i8_ ? "on (STRATA_INK_TRUNK_I8=1)" : "failed, BF16");
         }
         if (has_dspark_) {
@@ -2952,6 +3007,21 @@ private:
     }
 
     void launch_bf16_opt(const uint16_t* W, const float* X, const float* bias, float* Y, int M, int N, int K) {
+        if (exact_rows_ && M >= 2 && M <= 16 && trunk_i8_ && bias == nullptr && K <= 4096 && (K % 32) == 0) {
+            // 8-bit trunk: a verify row of a matrix with a Q8 copy takes the one-token step's Q8 arithmetic
+            const uint8_t* w8 = reinterpret_cast<const uint8_t*>(W);
+            for (const auto& e : q8_map_) {
+                if (w8 >= e.bf16 && w8 < e.bf16 + e.bytes && K == e.K) {
+                    const size_t row_off = static_cast<size_t>(w8 - e.bf16) / (2u * static_cast<size_t>(K));
+                    const size_t rows = e.bytes / (2u * static_cast<size_t>(K));
+                    const int8_t* wq = reinterpret_cast<const int8_t*>(e.q8->dev_ptr);
+                    const half_t* wd = reinterpret_cast<const half_t*>(e.q8->dev_ptr + rows * K);
+                    if (K <= 3072) k_q8_gemv_rows_mt<4><<<dim3((N + 7) / 8, (M + 3) / 4), 256, 0, stream_>>>(wq, wd, static_cast<int>(row_off), X, Y, M, N, K);
+                    else k_q8_gemv_rows<<<dim3((N + 7) / 8, M), 256, 0, stream_>>>(wq, wd, static_cast<int>(row_off), X, Y, N, K);
+                    return;
+                }
+            }
+        }
         if (exact_rows_ && M >= 2 && M <= 16) {
             launch_bf16_rows_exact(W, X, bias, Y, M, N, K, mem_info_.gen, stream_);
             return;
@@ -5824,9 +5894,10 @@ private:
         free_gpu_buffer(d_sconv_attn_all_); free_gpu_buffer(d_sconv_mlp_all_);
         for (auto& b : trunk_qkvrg_) free_gpu_buffer(b);
         trunk_qkvrg_.clear();
+        free_gpu_buffer(unembed_q8_);
         for (auto& b : trunk_qkvrg_q8_) free_gpu_buffer(b);
         for (auto& b : trunk_wo_q8_) free_gpu_buffer(b);
-        trunk_qkvrg_q8_.clear(); trunk_wo_q8_.clear(); trunk_i8_ = false;
+        trunk_qkvrg_q8_.clear(); trunk_wo_q8_.clear(); trunk_i8_ = false; q8_map_.clear();
         for (auto& kv : trunk_bf16_) free_gpu_buffer(kv.second);
         for (auto& kv : trunk_f32_) free_gpu_buffer(kv.second);
         for (auto& kv : packed_trunk_) free_gpu_buffer(kv.second.buf);
@@ -5964,10 +6035,21 @@ private:
     bool attn_gqa3_ = false;
     bool trunk_i8_ = false;
     std::vector<GpuBuffer> trunk_qkvrg_q8_, trunk_wo_q8_;
+    struct Q8MapEntry { const uint8_t* bf16; size_t bytes; int K; const GpuBuffer* q8; };
+    std::vector<Q8MapEntry> q8_map_;   // BF16 trunk matrix -> its Q8 copy (8-bit trunk with DSpark verify rows)
+    GpuBuffer unembed_q8_;   // a GGUF's own Q8_0 output.weight, rows [0, vocab_unpadded) (8-bit trunk only)
 
     // One-token unembed on k_unembed_softcap_one_sk (want index from sc_want_idx_, logits to sc_logits_). False: not
     // taken (switched off, or a table that is not S_K / too wide), the caller launches k_unembed_softcap instead.
     bool launch_unembed_one(const GpuPackedTensor& pk, const float* h_norm, int V, int D) {
+        if (trunk_i8_ && unembed_q8_.dev_ptr && (D % 32) == 0 && D <= 4096) {
+            const size_t nq = static_cast<size_t>(V) * D;
+            k_unembed_softcap_one_q8<4><<<(V + 31) / 32, 256, 0, stream_>>>(
+                reinterpret_cast<const int8_t*>(unembed_q8_.dev_ptr), reinterpret_cast<const half_t*>(unembed_q8_.dev_ptr + nq),
+                h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr), reinterpret_cast<float*>(sc_logits_.dev_ptr),
+                V, D, c_.logit_softcap);
+            return true;
+        }
         const int fmt = pk.info.fmt;
         if (!unembed_one_row_lds_ || fmt < CODE_S2_K || fmt > CODE_S8_K || sk_sb_bytes(fmt) <= 0 || (D & 255) != 0 || D > 16 * 256) return false;
         const dim3 grid((V + 31) / 32);   // 8 waves x 4 vocab rows
