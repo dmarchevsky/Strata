@@ -226,6 +226,16 @@ The ring check (`--ring-check`, 12,000 tokens in 2,048-token batches against one
 1.1e-6, top-1 100%. No GPU reset in the kernel log over these runs (one machine, `cwsr_enable=0`). 1,024 gave 281 tok/s
 at 8K, 4,096 gave 303-306.
 
+**Repeatable logits for several tokens.** Reading the same 3,000-token prompt ten times gave five different logit dumps
+(6 of 10 alike). The rows that differed were single rows, never their followers, off by at most about 0.05, and two
+launches of the batched unembed (`k_unembed_softcap`) on identical inputs in one process gave a different row about once
+in 1,500 to 15,000 rows. The final hidden rows were identical every time. Pinning the clocks, `-mcumode`, deterministic
+expert buckets and a second process on the GPU did not remove it. On gfx1103 the several-token unembed now runs on
+`k_unembed_softcap_rows_sk` (each token's row read into LDS once, the same arithmetic): the dumps came out identical
+in 7 of 7 runs, and repeated launches still differed now and then, about 10 times less often. The one-token kernels the
+server decodes with did not differ in 1,596 launches, which is not enough to say they never do. A low rate of read
+errors on this machine (non-ECC SO-DIMMs of two different builds) fits these results; a memory test would tell.
+
 Also measured, no change kept: GPU clocks forced to `high` (prompt +2%, decode unchanged: decode is bound by DDR5-5600);
 FP8 KV at 32K (decode 10.4 -> 10.5 tok/s, prompt 5% slower; k8v8 is not supported on HIP).
 

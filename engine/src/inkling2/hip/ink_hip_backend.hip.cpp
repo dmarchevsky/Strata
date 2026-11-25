@@ -5022,14 +5022,14 @@ private:
                          f32_ptr("model.llm.norm.weight"), h_norm);
         maybe_tap(c_.n_visits, h_norm);
         dbg_hash(192, h_norm, B, D);
-
         if (use_graph) {
             if (do_dspark_ctx) {
                 launch_dspark_ctx_kernels(B);
             }
             const int V = c_.vocab_unpadded;
             const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
-            if (!(B == 1 && launch_unembed_one(unemb_pk, h_norm, V, D)))
+            if (!(B == 1 && launch_unembed_one(unemb_pk, h_norm, V, D)) &&
+                !launch_unembed_rows(unemb_pk, h_norm, reinterpret_cast<float*>(sc_logits_.dev_ptr), B, V, D))
             k_unembed_softcap<<<dim3((V + 7) / 8, (B + 15) / 16), 256, 0, stream_>>>(
                 unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
                 h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
@@ -5100,7 +5100,8 @@ private:
                 (void)hipMemcpyAsync(sc_want_idx_.dev_ptr, want_idx.data(), n_want * 4, hipMemcpyHostToDevice, stream_);
                 const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
                 if (prof_on) (void)hipEventRecord(pev[9], stream_);
-                if (!(n_want == 1 && launch_unembed_one(unemb_pk, h_norm, V, D)))
+                if (!(n_want == 1 && launch_unembed_one(unemb_pk, h_norm, V, D)) &&
+                    !launch_unembed_rows(unemb_pk, h_norm, reinterpret_cast<float*>(sc_logits_.dev_ptr), n_want, V, D))
                 k_unembed_softcap<<<dim3((V + 7) / 8, (n_want + 15) / 16), 256, 0, stream_>>>(
                     unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
                     h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
@@ -6056,6 +6057,19 @@ private:
     struct Q8MapEntry { const uint8_t* bf16; size_t bytes; int K; const GpuBuffer* q8; };
     std::vector<Q8MapEntry> q8_map_;   // BF16 trunk matrix -> its Q8 copy (8-bit trunk with DSpark verify rows)
     GpuBuffer unembed_q8_;   // a GGUF's own Q8_0 output.weight, rows [0, vocab_unpadded) (8-bit trunk only)
+
+    // Several tokens' unembed of an S_K table on k_unembed_softcap_rows_sk (gfx1103 switch; same arithmetic per token as
+    // k_unembed_softcap). False: not taken, the caller launches k_unembed_softcap.
+    bool launch_unembed_rows(const GpuPackedTensor& pk, const float* h_norm, float* out, int n_want, int V, int D) {
+        const int fmt = pk.info.fmt;
+        if (!unembed_one_row_lds_ || n_want < 2 || fmt < CODE_S2_K || fmt > CODE_S8_K || sk_sb_bytes(fmt) <= 0 ||
+            (D & 255) != 0 || D > 2304) return false;
+        const dim3 grid((V + 15) / 16, (n_want + 7) / 8);   // 8 waves x 2 vocab rows, 8 tokens
+        const auto* wi = reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr);
+        if (fmt == CODE_S6_K) k_unembed_softcap_rows_sk<CODE_S6_K, 2, 8><<<grid, 256, 0, stream_>>>(pk.buf.dev_ptr, fmt, h_norm, wi, out, n_want, V, D, c_.logit_softcap);
+        else k_unembed_softcap_rows_sk<0, 2, 8><<<grid, 256, 0, stream_>>>(pk.buf.dev_ptr, fmt, h_norm, wi, out, n_want, V, D, c_.logit_softcap);
+        return true;
+    }
 
     // One-token unembed on k_unembed_softcap_one_sk (want index from sc_want_idx_, logits to sc_logits_). False: not
     // taken (switched off, or a table that is not S_K / too wide), the caller launches k_unembed_softcap instead.

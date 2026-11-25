@@ -3523,6 +3523,70 @@ __global__ void __launch_bounds__(256) k_unembed_softcap_one_sk(
     }
 }
 
+// Several tokens' unembed + softcap for an S_K table, built like k_unembed_softcap_one_sk: the T tokens' whole h_norm rows go
+// into LDS once (T * D halves), then each wave reads R vocab rows superblock by superblock with no barrier in between. Per
+// token the same arithmetic in the same order as k_unembed_softcap (which restages h per superblock and, on the 780M, was
+// seen to give an occasional different row between identical launches). Grid: ((V + 8R - 1) / (8R), (n_want + T - 1) / T).
+template <int kCode, int R, int T>
+__global__ void __launch_bounds__(256) k_unembed_softcap_rows_sk(
+    const uint8_t* __restrict__ unemb_raw, int fmt,
+    const float* __restrict__ h_norm, const int32_t* __restrict__ want_idx, float* __restrict__ logits_out,
+    int n_want, int V, int D, float softcap) {
+    const int code = kCode > 0 ? kCode : fmt;
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int v0 = (blockIdx.x * 8 + wave) * R;
+    const int wi0 = blockIdx.y * T;
+    if (wi0 >= n_want) return;
+    const int n_loc = min(T, n_want - wi0);
+    const int sb_b = sk_sb_bytes(code);
+    const int nsb = D >> 8;
+    __shared__ alignas(16) half_t sH[T * 2304];
+    for (int t = 0; t < n_loc; ++t) {
+        const float* h = h_norm + static_cast<size_t>(want_idx[wi0 + t]) * D;
+        for (int i = tid; i < (nsb << 8); i += 256) sH[t * 2304 + i] = static_cast<half_t>(h[i]);
+    }
+    __syncthreads();
+    const int j0 = lane * 8;
+    const int sub = j0 >> 6;
+    float acc[R][T];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < T; ++t) acc[r][t] = 0.0f;
+    for (int s = 0; s < nsb; ++s) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (v0 + r < V) {
+                const uint8_t* blk = unemb_raw + (static_cast<size_t>(v0 + r) * nsb + s) * sb_b;
+                const float eff = decode_sk_sub_eff_i8(blk, code, sub);
+                const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, code, j0);
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    if (t < n_loc) {
+                        const uint4 hv = *reinterpret_cast<const uint4*>(&sH[t * 2304 + (s << 8) + j0]);
+                        float d = fdot2_f32(wv.x, hv.x, 0.0f);
+                        d = fdot2_f32(wv.y, hv.y, d);
+                        d = fdot2_f32(wv.z, hv.z, d);
+                        d = fdot2_f32(wv.w, hv.w, d);
+                        acc[r][t] = fmaf(d, eff, acc[r][t]);
+                    }
+                }
+            }
+        }
+    }
+    const float inv_cap = 1.0f / softcap;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            if (t < n_loc) {
+                const float z = wave32_sum(acc[r][t]);
+                if (lane == 0 && v0 + r < V) logits_out[static_cast<size_t>(wi0 + t) * V + v0 + r] = softcap * tanhf(z * inv_cap);
+            }
+        }
+    }
+}
+
 // Multi-format DSpark combined unembed argmax stage 1: computes dot(unemb[v], combined) for all V, deterministic first-max!
 // Uses LDS-cached FP16 combined vector + fast 32-bit S_K unpack + fdot2_f32 for 3x faster Markov drafting!
 __global__ void __launch_bounds__(256) k5_dspark_packed_argmax_stage1(
